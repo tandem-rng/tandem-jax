@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
 [project]
 name = "tandem-jax"
@@ -21,8 +21,10 @@ classifiers = [
 Specification = "https://github.com/tandem-rng/spec"
 Source = "https://github.com/tandem-rng/tandem-jax"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/tandem_jax"]
+
+["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
