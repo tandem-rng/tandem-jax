@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tandem-jax"
+version = "0.1.0"
+description = "JAX PRNG implementation of Tandem8x32, a pseudorandom number generator fast on CPUs and GPUs alike"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "Jessica Cox"}]
+requires-python = ">=3.11"
+dependencies = ["jax>=0.10"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Specification = "https://github.com/tandem-rng/spec"
+Source = "https://github.com/tandem-rng/tandem-jax"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

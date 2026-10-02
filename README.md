@@ -1,0 +1,82 @@
+<p align="center"><img src="assets/lockup.png" width="560" alt="tandem rng"></p>
+
+# tandem-jax
+
+JAX key implementation of [Tandem8x32](https://github.com/tandem-rng/spec), a noncryptographic
+pseudorandom number generator built to be fast on CPUs and GPUs alike. Pure Python over
+`jax.numpy` and `jax.lax`, so it runs on every XLA backend. It produces the same stream, bit
+for bit, as the Julia reference [TandemRNG.jl](https://github.com/tandem-rng/TandemRNG.jl),
+the C reference [tandem-c](https://github.com/tandem-rng/tandem-c),
+[tandem-rs](https://github.com/tandem-rng/tandem-rs),
+[tandem-numpy](https://github.com/tandem-rng/tandem-numpy) and
+[tandem-cuda](https://github.com/tandem-rng/tandem-cuda).
+
+## Use
+
+```python
+import jax, jax.numpy as jnp
+import tandem_jax as tj
+
+key = tj.key(42)                                   # the generator of Julia Tandem8x32(42)
+k1, k2 = jax.random.split(key)                     # the spec's split by index
+step_key = jax.random.fold_in(key, 7)              # the spec's purpose 7
+z = jax.random.normal(k1, (1000,))                 # any jax.random function
+bits = jax.random.bits(key, (16,), jnp.uint32)     # the stream words from position 0
+
+x, pos = tj.stream(key, 0, 2**20, jnp.float64)     # the spec's Float64 draws, and the position after
+y, pos = tj.stream(key, pos, 100, jnp.uint8)       # continue at that position, aligned per the spec
+kids, pos = tj.fork(key, pos, 4)                   # the spec's fork at the current block
+```
+
+`tj.key(seed)` whitens the integer seed as the specification requires. `jax.random.split`
+gives spec children `split(0), split(1), ...`, and `jax.random.fold_in(key, u)` gives the spec's
+purpose child `sub(u)`. `jax.random.bits` reads the stream from position 0 with the spec's
+alignment, so `bits(key, shape, uint32)` are the stream words and `uint8`, `uint16` and
+`uint64` requests are the spec's narrower and wider draws.
+
+`jax.random.uniform` applies JAX's own bit mapping: 52 random bits for `float64` and 23 for
+`float32`. The specification keeps 53 and 24, as `(raw >> 11) * 2**-53` and
+`(raw >> 8) * 2**-24`, so `uniform` does not equal the Julia `rand(Float64)` draws.
+`tj.stream(key, position, n, dtype)` applies the spec's mappings for `float16`, `float32`
+and `float64`, and returns the raw aligned words for the unsigned integer types. The key
+implementation is the canonical `Tandem8x32-K32`. `stream` takes `chunk_length` for the
+other variants.
+
+64-bit types need `jax.config.update("jax_enable_x64", True)`. Without it the 32-bit
+multiplies are built from 16-bit halves, which also serves backends without 64-bit integers.
+
+## Install
+
+```sh
+pip install .
+```
+
+For development, `pixi install` creates an environment with the package installed editable,
+and `pixi run test` runs the tests.
+
+## Tests
+
+`tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
+of the spec repository's file, with a drift check in CI), compares positioned reads and
+`jax.random.bits` with dumps written by TandemRNG.jl (`tests/data`, shared with tandem-c),
+and runs the key implementation under `jit` and `vmap`.
+
+## Speed
+
+Apple M4, XLA CPU backend, `pixi run bench`, 2^24 Float64 draws, minimum of seven runs after
+a warm-up, load 5:
+
+| | GiB/s |
+|---|---|
+| `tandem_jax.stream(key, 0, n, float64)` | 6.4 |
+| `jax.random.uniform(tandem key, float64)` | 6.1 |
+| `jax.random.uniform(threefry key, float64)` | 5.1 |
+| `jax.random.uniform(rbg key, float64)` | 9.4 |
+
+XLA runs the elementwise step over all chunks at once and uses several threads. The rbg
+row is XLA's built-in generator op. The C fill on the same machine reaches 11.3 GiB/s on one
+thread.
+
+## License
+
+Apache License 2.0. See `LICENSE` and `NOTICE`.
