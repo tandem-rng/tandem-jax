@@ -1,4 +1,4 @@
-"""Tandem8x32 building blocks on uint32 arrays, after the specification and tandem-c."""
+"""Tandem8x32 building blocks on uint32 arrays, after the specification."""
 
 import jax
 import jax.numpy as jnp

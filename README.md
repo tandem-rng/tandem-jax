@@ -4,12 +4,8 @@
 
 JAX key implementation of [Tandem8x32](https://github.com/tandem-rng/spec), a noncryptographic
 pseudorandom number generator built to be fast on CPUs and GPUs alike. Pure Python over
-`jax.numpy` and `jax.lax`, so it runs on every XLA backend. It produces the same stream, bit
-for bit, as the Julia reference [TandemRNG.jl](https://github.com/tandem-rng/TandemRNG.jl),
-the C reference [tandem-c](https://github.com/tandem-rng/tandem-c),
-[tandem-rs](https://github.com/tandem-rng/tandem-rs),
-[tandem-numpy](https://github.com/tandem-rng/tandem-numpy) and
-[tandem-cuda](https://github.com/tandem-rng/tandem-cuda).
+`jax.numpy` and `jax.lax`, so it runs on every XLA backend. It produces the stream the
+specification defines, bit for bit.
 
 ## Use
 
@@ -17,7 +13,7 @@ the C reference [tandem-c](https://github.com/tandem-rng/tandem-c),
 import jax, jax.numpy as jnp
 import tandem_jax as tj
 
-key = tj.key(42)                                   # the generator of Julia Tandem8x32(42)
+key = tj.key(42)                                   # the spec's generator for seed 42      
 k1, k2 = jax.random.split(key)                     # the spec's split by index
 step_key = jax.random.fold_in(key, 7)              # the spec's purpose 7
 z = jax.random.normal(k1, (1000,))                 # any jax.random function
@@ -36,7 +32,7 @@ alignment, so `bits(key, shape, uint32)` are the stream words and `uint8`, `uint
 
 `jax.random.uniform` applies JAX's own bit mapping: 52 random bits for `float64` and 23 for
 `float32`. The specification keeps 53 and 24, as `(raw >> 11) * 2**-53` and
-`(raw >> 8) * 2**-24`, so `uniform` does not equal the Julia `rand(Float64)` draws.
+`(raw >> 8) * 2**-24`, so `uniform` does not equal the specification's Float64 draws.
 `tj.stream(key, position, n, dtype)` applies the spec's mappings for `float16`, `float32`
 and `float64`, and returns the raw aligned words for the unsigned integer types. The key
 implementation is the canonical `Tandem8x32-K32`. `stream` takes `chunk_length` for the
@@ -58,7 +54,7 @@ and `pixi run test` runs the tests.
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
 of the spec repository's file, with a drift check in CI), compares positioned reads and
-`jax.random.bits` with dumps written by TandemRNG.jl (`tests/data`, shared with tandem-c),
+`jax.random.bits` with reference stream dumps in `tests/data`,
 and runs the key implementation under `jit` and `vmap`.
 
 ## Speed
@@ -74,8 +70,7 @@ a warm-up, load 5:
 | `jax.random.uniform(rbg key, float64)` | 9.4 |
 
 XLA runs the elementwise step over all chunks at once and uses several threads. The rbg
-row is XLA's built-in generator op. The C fill on the same machine reaches 11.3 GiB/s on one
-thread.
+row is XLA's built-in generator op.
 
 ## License
 
