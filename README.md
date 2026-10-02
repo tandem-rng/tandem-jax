@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/lockup.png" width="560" alt="tandem rng"></p>
+<p align="center"><img src="assets/lockup.png" width="560" alt="tandem rng .jax"></p>
 
 # tandem-jax
 
