@@ -60,14 +60,14 @@ and runs the key implementation under `jit` and `vmap`.
 ## Speed
 
 Apple M4, XLA CPU backend, `pixi run bench`, 2^24 Float64 draws, minimum of seven runs after
-a warm-up, load 5:
+a warm-up, load 3 before the run (XLA itself uses several threads):
 
 | | GiB/s |
 |---|---|
-| `tandem_jax.stream(key, 0, n, float64)` | 6.4 |
-| `jax.random.uniform(tandem key, float64)` | 6.1 |
-| `jax.random.uniform(threefry key, float64)` | 5.1 |
-| `jax.random.uniform(rbg key, float64)` | 9.4 |
+| `tandem_jax.stream(key, 0, n, float64)` | 6.7 |
+| `jax.random.uniform(tandem key, float64)` | 6.6 |
+| `jax.random.uniform(threefry key, float64)` | 5.3 |
+| `jax.random.uniform(rbg key, float64)` | 9.9 |
 
 XLA runs the elementwise step over all chunks at once and uses several threads. The rbg
 row is XLA's built-in generator op.
