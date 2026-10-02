@@ -60,7 +60,7 @@ and runs the key implementation under `jit` and `vmap`.
 ## Speed
 
 Apple M4, XLA CPU backend, `pixi run bench`, 2^24 Float64 draws, minimum of seven runs after
-a warm-up, load 3 before the run (XLA itself uses several threads):
+a warm-up:
 
 | | GiB/s |
 |---|---|
