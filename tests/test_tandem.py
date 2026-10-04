@@ -499,3 +499,16 @@ def test_randint_width_follows_the_range_not_the_dtype():
     assert np.array_equal(np.array(full), np.array(tj.stream(k, 0, 100, jnp.uint32)[0]))
     s, p = tj.stream_randint(k, 3, 4, jnp.int64(-5), jnp.int64(-5), jnp.int64)
     assert np.array_equal(np.array(s), np.full(4, -5)) and int(p) == 32 + 4 * 32
+
+
+@pytest.mark.parametrize("name, dtype, w", [("device_below32_at", jnp.uint32, 32), ("device_below64_at", jnp.uint64, 64)])
+def test_randint_matches_cuda_fills_at_nonzero_starts(name, dtype, w):
+    k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)
+    assert sum(c["rejected"] for c in D[name]) > 50 and {c["start"] for c in D[name]} == {1, 12345}
+    for c in D[name]:
+        want = np.array(c["out"], dtype)
+        assert np.array_equal(np.array(tj.stream_randint(k, c["start"], 64, 0, c["range"], dtype, w)[0]), want), c
+        if (w == 32 or c["range"] > 2**32) and c["range"] < 2**63:
+            # Width from the range: an int64 result type must not change a 32-bit draw.
+            auto = tj.stream_randint(k, c["start"], 64, 0, c["range"], jnp.int64)[0]
+            assert np.array_equal(np.array(auto).astype(np.uint64), want.astype(np.uint64)), c

@@ -102,7 +102,7 @@ and `pixi run test` runs the tests.
 ## Tests
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
-of the spec repository's file, with a drift check in CI), checks `normal` and `randint` against the C and CUDA fixtures in `tests/cross_derived.json` (written by `tools/convert_c_fixtures.py`, rejections included, fills from positions 0, 1 and 12345), checks that a bounded fill cut at any element equals the whole fill and that `int32` and `int64` agree for a small range, checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
+of the spec repository's file, with a drift check in CI), checks `normal` and `randint` against the C and CUDA fixtures in `tests/cross_derived.json` (written by `tools/convert_c_fixtures.py`, rejections included, fills from positions 0, 1 and 12345, from both C and CUDA), checks that a bounded fill cut at any element equals the whole fill and that `int32` and `int64` agree for a small range, checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
 `jax.random.bits` with reference stream dumps in `tests/data`,
 fork children at traced positions, split children for indices up to 2^64 - 1 against a direct evaluation of F,
 and runs the key implementation under `jit` and `vmap`.

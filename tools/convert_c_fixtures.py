@@ -1,6 +1,6 @@
 """Writes tests/cross_derived.json from the fixture headers of the C reference.
 
-    python tools/convert_c_fixtures.py ../tandem-c/tests > tests/cross_derived.json
+    python tools/convert_c_fixtures.py ../tandem-c/tests ../tandem-cuda/tests > tests/cross_derived.json
 """
 
 import ast
@@ -36,9 +36,11 @@ def scalar(text, name):
 
 tests = Path(sys.argv[1])
 scalar_below = (tests / "cross_below.h").read_text()
-fill, normal, cuda_below, cuda_normal = (
-    (tests / f).read_text() for f in ("cross_fill_below.h", "cross_normal.h", "cuda_fill_below.h", "cuda_fill_normal.h")
+cuda_tests = Path(sys.argv[2])
+fill, normal, cuda_normal = (
+    (tests / f).read_text() for f in ("cross_fill_below.h", "cross_normal.h", "cuda_fill_normal.h")
 )
+cuda_below = (cuda_tests / "cross_fill_below.h").read_text()
 out = {
     # Sequential draws after one Bool, so from bit position 1, rejected draws consume the stream.
     "scalar_below32": [{"range": n, "out": o, "end_pos": e} for n, o, e in array(scalar_below, "CROSS_U32")],
@@ -53,6 +55,9 @@ out = {
     # Key of seed 42, K = 32, from the CUDA port. `rejected` counts elements on the fallback.
     "device_below32": [{"range": n, "rejected": r, "out": o} for n, r, o in array(cuda_below, "CROSS_BELOW32")],
     "device_below64": [{"range": n, "rejected": r, "out": o} for n, r, o in array(cuda_below, "CROSS_BELOW64")],
+    # Fills from bit positions 1 and 12345, where the global draw index differs from the element index.
+    "device_below32_at": [{"start": s, "range": n, "rejected": r, "out": o} for s, n, r, o in array(cuda_below, "CROSS_BELOW32_AT")],
+    "device_below64_at": [{"start": s, "range": n, "rejected": r, "out": o} for s, n, r, o in array(cuda_below, "CROSS_BELOW64_AT")],
     "device_normal64": [{"pos": p, "n": n, "out": o[:n]} for p, n, o in array(cuda_normal, "CROSS_NORMAL64")],
     "device_normal32": [{"pos": p, "n": n, "out": o[:n]} for p, n, o in array(cuda_normal, "CROSS_NORMAL32")],
 }
