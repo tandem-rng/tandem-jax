@@ -501,6 +501,50 @@ def test_randint_width_follows_the_range_not_the_dtype():
     assert np.array_equal(np.array(s), np.full(4, -5)) and int(p) == 32 + 4 * 32
 
 
+def test_randint_clips_bounds_like_jax():
+    k, n = tj.key(13), 4000
+    # Bounds past the dtype clip, and a maxval above it includes the largest value.
+    b = tj.randint(k, (n,), 0, 256, jnp.uint8)
+    assert np.array_equal(np.array(b), np.array(tj.randint(k, (n,), 0, 256, jnp.int32)).astype(np.uint8))
+    assert int(b.max()) == 255 and len(np.unique(np.array(b))) == 256
+    s = tj.randint(k, (n,), -1000, 1000, jnp.int8)
+    assert np.array_equal(np.array(s), np.array(tj.randint(k, (n,), -128, 128, jnp.int16)).astype(np.int8))
+    assert np.array_equal(np.array(tj.randint(k, (9,), 300, 400, jnp.uint8)), np.full(9, 255))
+    # The whole range of a 32- or 64-bit dtype is every draw of that width, offset by minval.
+    u32 = np.array(tj.stream(k, 3, n, jnp.uint32)[0])
+    i32 = tj.stream_randint(k, 3, n, -(2**31), 2**31, jnp.int32)
+    assert np.array_equal(np.array(i32[0]), (u32 ^ np.uint32(2**31)).view(np.int32)) and int(i32[1]) == 32 + 32 * n
+    assert np.array_equal(np.array(tj.randint(k, (n,), 0, 2**32, jnp.uint32, 3)), u32)
+    assert np.array_equal(np.array(tj.randint(k, (n,), -(2**31), 2**31, jnp.int64, 3)), np.array(i32[0]))
+    u64 = np.array(tj.stream(k, 3, n, jnp.uint64)[0])
+    assert np.array_equal(np.array(tj.randint(k, (n,), 0, 2**64, jnp.uint64, 3)), u64)
+    assert np.array_equal(np.array(tj.randint(k, (n,), -(2**63), 2**63, jnp.int64, 3)), (u64 ^ np.uint64(2**63)).view(np.int64))
+    # Range 2^32 in 64-bit draws keeps the high half of each draw, whatever the dtype.
+    w64 = np.array(tj.randint(k, (n,), 0, 2**32, jnp.uint32, 3, width=64))
+    assert np.array_equal(w64, (u64 >> np.uint64(32)).astype(np.uint32))
+    assert np.array_equal(np.array(tj.randint(k, (n,), 0, 2**32, jnp.int64, 3, width=64)), w64.astype(np.int64))
+    f = jax.jit(lambda k, p: tj.randint(k, (n,), -(2**63), 2**63, jnp.int64, p))
+    assert np.array_equal(np.array(f(k, jnp.uint64(3))), (u64 ^ np.uint64(2**63)).view(np.int64))
+    for hi in (2**32 + 1, 2**64):
+        with pytest.raises(ValueError, match="width 32"):
+            tj.randint(k, (4,), 0, hi, jnp.uint64, width=32)
+
+
+def test_randint_array_bounds_under_jit_and_vmap():
+    keys = jax.random.split(tj.key(5), 4)
+    f = lambda k, a, b: tj.randint(k, (300,), a, b, jnp.int64)
+    # One row per width: each row takes its width from its own largest range.
+    lo = jnp.stack([jnp.arange(300, dtype=jnp.int64) - 150, jnp.full(300, -7, jnp.int64)])
+    hi = jnp.stack([lo[0] + 2**31 + 1, jnp.full(300, 2**35, jnp.int64)])
+    batched = jax.jit(jax.vmap(f, (None, 0, 0)))(keys[1], lo, hi)
+    for i in range(2):
+        assert np.array_equal(np.array(batched[i]), np.array(f(keys[1], lo[i], hi[i])))
+    his = jnp.array([10, 2**31 + 1, 2**33, 2**40 + 3], jnp.int64)
+    rows = jax.jit(jax.vmap(f, (0, None, 0)))(keys, 0, his)
+    for i in range(4):
+        assert np.array_equal(np.array(rows[i]), np.array(f(keys[i], 0, int(his[i]))))
+
+
 @pytest.mark.parametrize("name, dtype, w", [("device_below32_at", jnp.uint32, 32), ("device_below64_at", jnp.uint64, 64)])
 def test_randint_matches_cuda_fills_at_nonzero_starts(name, dtype, w):
     k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)

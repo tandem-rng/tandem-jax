@@ -42,7 +42,10 @@ dtype does not change the values, and `width` names it as the `u32` and `u64` fi
 CUDA ports do. A rejected draw retries on the fallback stream `split(g)` of `sub(0x424c573332)`
 (`0x424c573634` for 64 bits) from position 0, with `g` the index of the draw in the key's stream,
 so a fill cut at any element boundary equals the whole fill. The retry loop runs only when a
-draw was rejected. `maxval <= minval` gives `minval`. Bounded integers and uniforms are exact
+draw was rejected. `maxval <= minval` gives `minval`. As in `jax.random.randint`, Python int
+bounds outside the dtype clip to it, and a `maxval` above it includes the largest value, so
+`randint(key, n, 0, 256, jnp.uint8)` gives every byte. `width=32` needs ranges of at most 2^32.
+Bounded integers and uniforms are exact
 across ports. Normals agree to the tolerance of Appendix A. Neither equals `jax.random.normal`
 or `jax.random.randint`.
 

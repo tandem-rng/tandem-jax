@@ -413,11 +413,16 @@ def _retry(key, g, pending, r, t, w, K):
     return lax.while_loop(lambda s: s[2].any(), body, init)[1]
 
 
-def _bounded(k, position, n, lo, r, w):
-    """`n` draws of width `w` on [0, r) plus `lo`, in the unsigned type of `lo`, and the position after."""
+def _bounded(k, position, n, lo, r, full, w):
+    """`n` draws of width `w` on [0, r) plus `lo`, in the unsigned type of `lo`, and the position
+    after. `full` marks the range 2^bits of `r`'s type, which `r` holds as 0."""
     wide = jnp.dtype(f"uint{w}")
-    # A range of exactly 2^32 reaches this width only from a 64-bit type: every draw is a value.
-    full = (r == 2**32) if w == 32 and r.dtype.itemsize == 8 else None
+    if r.dtype.itemsize * 8 > w:
+        # A range of 2^32 reaches 32-bit draws only from a 64-bit type: every draw is a value.
+        full = r == 2**32
+    elif r.dtype.itemsize * 8 < w:
+        r = r.astype(wide) + (jnp.asarray(full, wide) << wide.type(32))
+        full = False
     r = r.astype(wide)
     draws, pos = stream(k, position, n, wide)
     t = _threshold(r, w)
@@ -449,9 +454,18 @@ def _bounded(k, position, n, lo, r, w):
 
     branches = [lambda _: plain, few] + ([many] if n > _RETRY_MAX else [])
     val = lax.switch((count > 0).astype(jnp.int32) + (count > _RETRY_MAX).astype(jnp.int32), branches, None)
-    if full is not None:
+    if full is not False:
         val = jnp.where(full, draws, val)
     return lo + val.astype(lo.dtype), pos
+
+
+def _bound(v, dtype):
+    """A bound in `dtype`, and whether it lay above the dtype's range. A Python int outside the
+    range clips to it, as in `jax.random.randint`."""
+    if isinstance(v, int):
+        info = jnp.iinfo(dtype)
+        return jnp.asarray(min(max(v, info.min), info.max), dtype), v > info.max
+    return jnp.asarray(v, dtype), False
 
 
 def stream_randint(k, position, n, minval, maxval, dtype=None, width=None):
@@ -459,32 +473,48 @@ def stream_randint(k, position, n, minval, maxval, dtype=None, width=None):
     after them, by Lemire's method as in Appendix A. Element `i` uses uniform draw `i`. The
     draw width follows the range, 32 bits when it is at most 2^32 and 64 otherwise, so `dtype`
     does not change the values. A rejected draw retries on a fallback stream keyed by the draw's
-    index in the key's stream. `n` draws are consumed. `maxval <= minval` gives `minval`. `n = 0`
-    leaves the position unchanged. `minval` and `maxval` are scalars or arrays of length `n`; the
-    width then follows the largest range. `width` of 32 or 64 names the draw width instead, as
-    the `u32` and `u64` fills of the C and CUDA ports do."""
+    index in the key's stream. `n` draws are consumed. `maxval <= minval` gives `minval`. A
+    Python int `maxval` above the dtype's range includes its largest value, as in
+    `jax.random.randint`. `n = 0` leaves the position unchanged. `minval` and `maxval` are
+    scalars or arrays of length `n`; the width then follows the largest range. `width` of 32 or
+    64 names the draw width instead, as the `u32` and `u64` fills of the C and CUDA ports do, and
+    32 needs ranges of at most 2^32."""
     dtype = jnp.dtype(dtype if dtype is not None else jnp.int64 if jax.config.jax_enable_x64 else jnp.int32)
     if not jnp.issubdtype(dtype, jnp.integer):
         raise TypeError(f"randint needs an integer dtype, got {dtype}")
-    wide = jnp.dtype("uint64" if dtype.itemsize == 8 else "uint32")
-    lo_s, hi_s = jnp.asarray(minval, dtype), jnp.asarray(maxval, dtype)
-    lo = lo_s.astype(wide)
-    r = jnp.where(hi_s > lo_s, hi_s.astype(wide) - lo, wide.type(0))
-    if n == 0:
-        return jnp.zeros(0, dtype), _position(position)
     if width not in (None, 32, 64):
         raise ValueError(f"width must be 32 or 64, got {width}")
+    wide = jnp.dtype("uint64" if dtype.itemsize == 8 else "uint32")
+    (lo_s, _), (hi_s, over) = _bound(minval, dtype), _bound(maxval, dtype)
+    lo = lo_s.astype(wide)
+    if over:
+        r = hi_s.astype(wide) - lo + wide.type(1)
+        # Only the whole range of a 32- or 64-bit dtype wraps r to 0.
+        full = (r == 0) if dtype.itemsize == wide.itemsize else False
+    else:
+        r, full = jnp.where(hi_s > lo_s, hi_s.astype(wide) - lo, wide.type(0)), False
+    if width == 32 and wide.itemsize == 8:
+        try:
+            too_wide = bool(jnp.any((r > wide.type(2**32)) | full))
+        except jax.errors.ConcretizationTypeError:
+            too_wide = False
+        if too_wide:
+            raise ValueError("width 32 needs ranges of at most 2^32")
+    if n == 0:
+        return jnp.zeros(0, dtype), _position(position)
 
     def xla():
         if width is not None or wide.itemsize == 4:
-            val, pos = _bounded(k, position, n, lo, r, width or 32)
+            val, pos = _bounded(k, position, n, lo, r, full, width or 32)
         else:
-            wide_range = r.max() > wide.type(2**32)
+            wide_range = jnp.any((r > wide.type(2**32)) | full)
             try:
-                val, pos = _bounded(k, position, n, lo, r, 64 if bool(wide_range) else 32)
+                val, pos = _bounded(k, position, n, lo, r, full, 64 if bool(wide_range) else 32)
             except jax.errors.TracerBoolConversionError:
                 val, pos = lax.cond(
-                    wide_range, lambda: _bounded(k, position, n, lo, r, 64), lambda: _bounded(k, position, n, lo, r, 32)
+                    wide_range,
+                    lambda: _bounded(k, position, n, lo, r, full, 64),
+                    lambda: _bounded(k, position, n, lo, r, full, 32),
                 )
         return val.astype(dtype), pos
 
@@ -500,8 +530,9 @@ def stream_randint(k, position, n, minval, maxval, dtype=None, width=None):
             return val, _align(p, w) + w * n
         return val, jnp.where(r > wide.type(2**32), _align(p, 64) + 64 * n, _align(p, 32) + 32 * n)
 
-    # Per-element bounds take the XLA path, the kernels take one range per fill.
-    supported = jnp.ndim(lo) == 0 and jnp.ndim(r) == 0 and _chunk_length(k) >= _ffi.TILE_STEPS
+    # Per-element bounds take the XLA path, the kernels take one range per fill. The kernels
+    # read a range of 0 as empty, so a dtype's whole range takes the XLA path too.
+    supported = jnp.ndim(lo) == 0 and jnp.ndim(r) == 0 and full is False and _chunk_length(k) >= _ffi.TILE_STEPS
     return _ffi.on_cuda(supported, cuda, xla)
 
 
