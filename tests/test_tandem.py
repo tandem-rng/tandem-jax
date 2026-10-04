@@ -387,11 +387,36 @@ def test_normal_edge_cases():
 
 @pytest.mark.parametrize("name, dtype", [("fill_below32", jnp.uint32), ("fill_below64", jnp.uint64)])
 def test_randint_matches_c_fills(name, dtype):
-    k = tj.key(42)
+    k, w = tj.key(42), 32 if dtype == jnp.uint32 else 64
     for c in D[name]:
-        got, pos = tj.stream_randint(k, 1, len(c["out"]), 0, c["range"], dtype)
-        assert np.array_equal(np.array(got), np.array(c["out"], dtype)), c["range"]
+        got, pos = tj.stream_randint(k, c["start"], len(c["out"]), 0, c["range"], dtype, w)
+        assert np.array_equal(np.array(got), np.array(c["out"], dtype)), (c["start"], c["range"])
         assert int(pos) == c["end_pos"]
+        assert np.array_equal(np.array(tj.randint(k, (len(c["out"]),), 0, c["range"], dtype, c["start"], w)), np.array(got))
+    assert {c["start"] for c in D[name]} >= {0, 1, 12345}
+    # The fallback key depends on the start, so the fixtures at 12345 must contain rejections.
+    big = [c for c in D[name] if c["start"] == 12345 and c["range"] > 2**31]
+    plain = lambda c: (np.array(tj.stream(k, 12345, 64, dtype)[0]).astype(object) * c["range"]) >> w
+    assert any(list(plain(c)) != c["out"] for c in big)
+
+
+@pytest.mark.parametrize("name, w", [("scalar_below32", 32), ("scalar_below64", 64)])
+def test_scalar_bounded_fixtures_match_sequential_lemire(name, w):
+    # A scalar draw rejects by taking the next draw of the main stream, which stream_randint
+    # does not do, so the fixture is checked against Lemire's loop over the plain draws.
+    k = tj.key(42)
+    draws = [int(x) for x in np.array(tj.stream(k, 1, 600, jnp.dtype(f"uint{w}"))[0])]
+    for c in D[name]:
+        r, out, used = c["range"], [], 0
+        t = ((1 << w) - r) % r
+        while len(out) < len(c["out"]):
+            m = draws[used] * r
+            used += 1
+            if m % (1 << w) >= t:
+                out.append(m >> w)
+        assert out == c["out"], r
+        # The fixture starts at bit 1, which aligns up to one draw width.
+        assert w + w * used == c["end_pos"], r
 
 
 @pytest.mark.parametrize("name, dtype", [("device_below32", jnp.uint32), ("device_below64", jnp.uint64)])
@@ -399,9 +424,9 @@ def test_randint_matches_cuda_fills_with_rejections(name, dtype):
     k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)
     assert max(c["rejected"] for c in D[name]) > 30
     for c in D[name]:
-        want = np.array(c["out"], dtype)
-        assert np.array_equal(np.array(tj.stream_randint(k, 0, 64, 0, c["range"], dtype)[0]), want), c["range"]
-        assert np.array_equal(np.array(tj.randint(k, (64,), 0, c["range"], dtype)), want)
+        want, w = np.array(c["out"], dtype), 32 if dtype == jnp.uint32 else 64
+        assert np.array_equal(np.array(tj.stream_randint(k, 0, 64, 0, c["range"], dtype, w)[0]), want), c["range"]
+        assert np.array_equal(np.array(tj.randint(k, (64,), 0, c["range"], dtype, width=w)), want)
 
 
 def test_randint_bounds_dtypes_and_heavy_rejection():
@@ -436,3 +461,41 @@ def test_randint_rejections_across_blocks(monkeypatch):
     assert 5 < len(changed) <= 64 and changed.max() - changed.min() > 10_000
     monkeypatch.setattr(tj, "_RETRY_MAX", 1)
     assert np.array_equal(np.array(tj.stream_randint(k, 0, n, 0, r, jnp.uint32)[0]), got)
+
+
+def test_randint_cut_equals_whole_at_rejections():
+    # Range 2^31 + 1 rejects about half the draws, so the cuts straddle many rejected draws.
+    k, r, n = tj.key(3), 2**31 + 1, 300
+    for start in (0, 1, 12345):
+        whole, end = tj.stream_randint(k, start, n, 0, r, jnp.int64)
+        plain = (np.array(tj.stream(k, start, n, jnp.uint32)[0]).astype(np.uint64) * r) >> 32
+        assert 50 < np.sum(plain != np.array(whole)) < 250
+        pos, parts = start, []
+        for m in (1, 63, 101, 135):
+            part, pos = tj.stream_randint(k, pos, m, 0, r, jnp.int64)
+            parts.append(np.array(part))
+        assert np.array_equal(np.concatenate(parts), np.array(whole)) and int(pos) == int(end)
+    k64, r64 = tj.key(3), 2**63 + 1
+    whole, end = tj.stream_randint(k64, 5, 200, 0, r64, jnp.uint64)
+    a, mid = tj.stream_randint(k64, 5, 77, 0, r64, jnp.uint64)
+    b, pos = tj.stream_randint(k64, mid, 123, 0, r64, jnp.uint64)
+    assert np.array_equal(np.concatenate([np.array(a), np.array(b)]), np.array(whole)) and int(pos) == int(end)
+
+
+def test_randint_width_follows_the_range_not_the_dtype():
+    k = tj.key(11)
+    for lo, hi in ((0, 1000), (-50, 2**31 - 1), (-(2**31), 2**31 - 1)):
+        i32, p32 = tj.stream_randint(k, 7, 500, lo, hi, jnp.int32)
+        i64, p64 = tj.stream_randint(k, 7, 500, lo, hi, jnp.int64)
+        assert np.array_equal(np.array(i32), np.array(i64)) and int(p32) == int(p64) == 32 + 500 * 32
+    # Above 2^32 the draws are 64 bits wide, below it they are 32 bits wide, under jit too.
+    f = jax.jit(lambda k, hi: tj.stream_randint(k, 0, 8, 0, hi, jnp.int64))
+    assert int(f(k, jnp.int64(2**32))[1]) == 8 * 32
+    assert int(f(k, jnp.int64(2**32 + 1))[1]) == 8 * 64
+    eager = tj.stream_randint(k, 0, 8, 0, 2**40, jnp.int64)
+    assert np.array_equal(np.array(f(k, jnp.int64(2**40))[0]), np.array(eager[0]))
+    # Range 2^32 is every 32-bit draw unchanged.
+    full = tj.stream_randint(k, 0, 100, 0, 2**32, jnp.int64)[0]
+    assert np.array_equal(np.array(full), np.array(tj.stream(k, 0, 100, jnp.uint32)[0]))
+    s, p = tj.stream_randint(k, 3, 4, jnp.int64(-5), jnp.int64(-5), jnp.int64)
+    assert np.array_equal(np.array(s), np.full(4, -5)) and int(p) == 32 + 4 * 32

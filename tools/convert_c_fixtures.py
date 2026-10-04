@@ -35,13 +35,17 @@ def scalar(text, name):
 
 
 tests = Path(sys.argv[1])
+scalar_below = (tests / "cross_below.h").read_text()
 fill, normal, cuda_below, cuda_normal = (
     (tests / f).read_text() for f in ("cross_fill_below.h", "cross_normal.h", "cuda_fill_below.h", "cuda_fill_normal.h")
 )
 out = {
-    # Seed 42, one Bool draw first, so the fill starts at bit position 1 and aligns up.
-    "fill_below32": [{"range": n, "out": o, "end_pos": e} for n, o, e in array(fill, "CROSS_FILL_U32")],
-    "fill_below64": [{"range": n, "out": o, "end_pos": e} for n, o, e in array(fill, "CROSS_FILL_U64")],
+    # Sequential draws after one Bool, so from bit position 1, rejected draws consume the stream.
+    "scalar_below32": [{"range": n, "out": o, "end_pos": e} for n, o, e in array(scalar_below, "CROSS_U32")],
+    "scalar_below64": [{"range": n, "out": o, "end_pos": e} for n, o, e in array(scalar_below, "CROSS_U64")],
+    # Seed 42, fills from bit positions 0, 1 and 12345, which align up to the draw width.
+    "fill_below32": [{"start": s, "range": n, "out": o, "end_pos": e} for s, n, o, e in array(fill, "CROSS_FILL_U32")],
+    "fill_below64": [{"start": s, "range": n, "out": o, "end_pos": e} for s, n, o, e in array(fill, "CROSS_FILL_U64")],
     "pairs64": array(normal, "CROSS_NORMAL"),
     "pairs64_end_pos": scalar(normal, "CROSS_NORMAL_END_POS"),
     "pairs32": array(normal, "CROSS_NORMALF"),

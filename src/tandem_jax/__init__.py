@@ -303,7 +303,13 @@ def stream_normal(k, position, n, dtype=None):
         raise TypeError(f"normal needs float32 or float64, got {dtype}")
     if n == 0:
         return jnp.zeros(0, dtype), _position(position)
-    u, pos = stream(k, position, 2 * ((n + 1) // 2), dtype)
+    return _normal(key_data(k), _position(position), n, dtype, _chunk_length(k))
+
+
+@functools.partial(jax.jit, static_argnames=("n", "dtype", "chunk"))
+def _normal(key, position, n, dtype, chunk):
+    # One jit so the uniforms, log, sqrt, sin and cos fuse into one pass over the output.
+    u, pos = stream(key, position, 2 * ((n + 1) // 2), dtype, chunk)
     a, b = u[0::2], u[1::2]
     r = jnp.sqrt(-2 * jnp.log(1 - a))
     # Reduce to a quadrant and an angle in [-1/8, 1/8] of a turn first: b - q / 4 is exact, so
@@ -368,13 +374,14 @@ def _fallback_draw(child, d, w, K):
     return words[offset].astype(jnp.uint64) | (words[offset + 1].astype(jnp.uint64) << jnp.uint64(32))
 
 
-def _retry(key, idx, pending, r, t, w, K):
-    """Bounded draws of the elements `idx` that took the fallback: element `i` retries on
-    split(i) of sub(PURPOSE) of the fill's key at position 0, draw after draw until Lemire accepts."""
+def _retry(key, g, pending, r, t, w, K):
+    """Bounded draws of the elements with global draw index `g` that took the fallback: each
+    retries on split(g) of sub(PURPOSE) of the fill's key at position 0, draw after draw until
+    Lemire accepts."""
     purpose = PURPOSE_BELOW32 if w == 32 else PURPOSE_BELOW64
     lo, hi = U32(purpose & 0xFFFFFFFF), U32(purpose >> 32)
     o, _ = F_keyed(key, (lo, hi), DOMAIN_FOLD, 0)
-    child = _split_words(o, idx)
+    child = _split_words(o, g)
     child = tuple(child[..., i] for i in range(4))
 
     def body(s):
@@ -382,33 +389,23 @@ def _retry(key, idx, pending, r, t, w, K):
         v, rej = _lemire(_fallback_draw(child, d, w, K), r, t, w)
         return d + U32(1), jnp.where(pend, v, val), pend & rej
 
-    init = (U32(0), jnp.zeros(idx.shape, jnp.uint32 if w == 32 else jnp.uint64), pending)
+    init = (U32(0), jnp.zeros(g.shape, jnp.uint32 if w == 32 else jnp.uint64), pending)
     return lax.while_loop(lambda s: s[2].any(), body, init)[1]
 
 
-def stream_randint(k, position, n, minval, maxval, dtype=None):
-    """`n` integers uniform on [minval, maxval) from stream bit `position`, and the position
-    after them, by Lemire's method as in Appendix A. Element `i` uses uniform draw `i`, 32 bits
-    for dtypes up to 32 bits and 64 bits otherwise, and a rejected draw retries on a fallback
-    stream. `n` draws are consumed. `maxval <= minval` gives `minval`. `n = 0` leaves the
-    position unchanged. `minval` and `maxval` are scalars or arrays of length `n`."""
-    dtype = jnp.dtype(dtype if dtype is not None else jnp.int64 if jax.config.jax_enable_x64 else jnp.int32)
-    if not jnp.issubdtype(dtype, jnp.integer):
-        raise TypeError(f"randint needs an integer dtype, got {dtype}")
-    w = 64 if dtype.itemsize == 8 else 32
+def _bounded(k, position, n, lo, r, w):
+    """`n` draws of width `w` on [0, r) plus `lo`, in the unsigned type of `lo`, and the position after."""
     wide = jnp.dtype(f"uint{w}")
-    lo_s, hi_s = jnp.asarray(minval, dtype), jnp.asarray(maxval, dtype)
-    lo_u, hi_u = lo_s.astype(wide), hi_s.astype(wide)
-    r = jnp.where(hi_s > lo_s, hi_u - lo_u, wide.type(0))
-    if n == 0:
-        return jnp.zeros(0, dtype), _position(position)
+    # A range of exactly 2^32 reaches this width only from a 64-bit type: every draw is a value.
+    full = (r == 2**32) if w == 32 and r.dtype.itemsize == 8 else None
+    r = r.astype(wide)
     draws, pos = stream(k, position, n, wide)
     t = _threshold(r, w)
     plain, rej = _lemire(draws, r, t, w)
     chunk, key = _chunk_length(k), tuple(key_data(k))
-    index = jnp.uint64 if n > 2**32 else U32
-    if n > 2**32 and not jax.config.jax_enable_x64:
-        raise ValueError(f"{n} elements need jax_enable_x64, the index exceeds 32 bits")
+    # The fallback is keyed by the draw's index in the key's stream, so a fill cut at any
+    # element boundary equals the whole fill.
+    g0 = pos // pos.dtype.type(w) - pos.dtype.type(n)
     pick = (lambda a, i: a[i]) if r.ndim else (lambda a, i: a)
     blocks = -(-n // _BLOCK)
     per_block = jnp.pad(rej, (0, blocks * _BLOCK - n)).reshape(blocks, _BLOCK)
@@ -421,24 +418,59 @@ def stream_randint(k, position, n, minval, maxval, dtype=None):
         rows = jnp.nonzero(in_block, size=cap, fill_value=0)[0]
         hit = per_block[rows] & (jnp.arange(cap) < (in_block > 0).sum())[:, None]
         flat = jnp.nonzero(hit.reshape(-1), size=cap, fill_value=0)[0]
-        idx = (rows[flat // _BLOCK] * _BLOCK + flat % _BLOCK).astype(index)
+        idx = (rows[flat // _BLOCK] * _BLOCK + flat % _BLOCK).astype(pos.dtype)
         active = jnp.arange(cap) < count
-        fixed = _retry(key, idx, active, pick(r, idx), pick(t, idx), w, chunk)
+        fixed = _retry(key, g0 + idx, active, pick(r, idx), pick(t, idx), w, chunk)
         return plain.at[jnp.where(active, idx, n)].set(fixed, mode="drop")
 
     def many(_):
-        fixed = _retry(key, jnp.arange(n, dtype=index), rej, r, t, w, chunk)
+        fixed = _retry(key, g0 + jnp.arange(n, dtype=pos.dtype), rej, r, t, w, chunk)
         return jnp.where(rej, fixed, plain)
 
     branches = [lambda _: plain, few] + ([many] if n > _RETRY_MAX else [])
     val = lax.switch((count > 0).astype(jnp.int32) + (count > _RETRY_MAX).astype(jnp.int32), branches, None)
-    return (lo_u + val).astype(dtype), pos
+    if full is not None:
+        val = jnp.where(full, draws, val)
+    return lo + val.astype(lo.dtype), pos
 
 
-def randint(k, shape, minval, maxval, dtype=None, position=0):
+def stream_randint(k, position, n, minval, maxval, dtype=None, width=None):
+    """`n` integers uniform on [minval, maxval) from stream bit `position`, and the position
+    after them, by Lemire's method as in Appendix A. Element `i` uses uniform draw `i`. The
+    draw width follows the range, 32 bits when it is at most 2^32 and 64 otherwise, so `dtype`
+    does not change the values. A rejected draw retries on a fallback stream keyed by the draw's
+    index in the key's stream. `n` draws are consumed. `maxval <= minval` gives `minval`. `n = 0`
+    leaves the position unchanged. `minval` and `maxval` are scalars or arrays of length `n`; the
+    width then follows the largest range. `width` of 32 or 64 names the draw width instead, as
+    the `u32` and `u64` fills of the C and CUDA ports do."""
+    dtype = jnp.dtype(dtype if dtype is not None else jnp.int64 if jax.config.jax_enable_x64 else jnp.int32)
+    if not jnp.issubdtype(dtype, jnp.integer):
+        raise TypeError(f"randint needs an integer dtype, got {dtype}")
+    wide = jnp.dtype("uint64" if dtype.itemsize == 8 else "uint32")
+    lo_s, hi_s = jnp.asarray(minval, dtype), jnp.asarray(maxval, dtype)
+    lo = lo_s.astype(wide)
+    r = jnp.where(hi_s > lo_s, hi_s.astype(wide) - lo, wide.type(0))
+    if n == 0:
+        return jnp.zeros(0, dtype), _position(position)
+    if width not in (None, 32, 64):
+        raise ValueError(f"width must be 32 or 64, got {width}")
+    if width is not None or wide.itemsize == 4:
+        val, pos = _bounded(k, position, n, lo, r, width or 32)
+    else:
+        wide_range = r.max() > wide.type(2**32)
+        try:
+            val, pos = _bounded(k, position, n, lo, r, 64 if bool(wide_range) else 32)
+        except jax.errors.TracerBoolConversionError:
+            val, pos = lax.cond(
+                wide_range, lambda: _bounded(k, position, n, lo, r, 64), lambda: _bounded(k, position, n, lo, r, 32)
+            )
+    return val.astype(dtype), pos
+
+
+def randint(k, shape, minval, maxval, dtype=None, position=0, width=None):
     """Integers of `shape` uniform on [minval, maxval) from stream bit `position`, as
     `stream_randint` returns them. Same call shape as `jax.random.randint`, with different
     values. The bounds may be arrays that broadcast to `shape`. Returns the array only."""
     shape = (shape,) if isinstance(shape, int) else tuple(shape)
     flat = lambda a: a if jnp.ndim(a) == 0 else jnp.broadcast_to(a, shape).reshape(-1)
-    return stream_randint(k, position, math.prod(shape), flat(minval), flat(maxval), dtype)[0].reshape(shape)
+    return stream_randint(k, position, math.prod(shape), flat(minval), flat(maxval), dtype, width)[0].reshape(shape)

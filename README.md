@@ -35,18 +35,21 @@ or array, traced or not, and returns typed keys. `jax.random.split(key, n)` give
 `ValueError` instead of repeating keys.
 
 `tj.normal(key, shape, dtype, position=0)` and `tj.randint(key, shape, minval, maxval, dtype,
-position=0)` follow Appendix A of the specification, so every port returns the same values.
-`stream_normal(key, position, n, dtype)` and `stream_randint(key, position, n, minval, maxval,
-dtype)` return the draws and the position after them, which is aligned to the draw width plus
-`2 * ceil(n / 2)` draws for normals and `n` draws for bounded integers, and unchanged for
-`n = 0`. Normals are Box-Muller pairs: elements `2j` and `2j + 1` are `r cos 2 pi b` and
-`r sin 2 pi b` from uniform draws `2j` and `2j + 1`, computed in `float32` or `float64` as the
-dtype says. Bounded integers use Lemire's method on draw `i` for element `i`, 32 bits for
-dtypes up to 32 bits and 64 bits otherwise. A rejected draw retries on the fallback stream
-`split(i)` of `sub(0x424c573332)` (`0x424c573634` for 64 bits) from position 0, in a loop that
-runs only when a draw was rejected. `maxval <= minval` gives `minval`. Bounded integers and
-uniforms are exact across ports. Normals agree to the tolerance of Appendix A. Neither equals
-`jax.random.normal` or `jax.random.randint`.
+position=0, width=None)` follow Appendix A of the specification, so every port returns the same
+values. `stream_normal(key, position, n, dtype)` and `stream_randint(key, position, n, minval,
+maxval, dtype, width=None)` return the draws and the position after them, which is aligned to
+the draw width plus `2 * ceil(n / 2)` draws for normals and `n` draws for bounded integers, and
+unchanged for `n = 0`. Normals are Box-Muller pairs: elements `2j` and `2j + 1` are
+`r cos 2 pi b` and `r sin 2 pi b` from uniform draws `2j` and `2j + 1`, computed in `float32` or
+`float64` as the dtype says, in one fused `jit`. Bounded integers use Lemire's method on draw `i`
+for element `i`. The draw width follows the range, 32 bits up to 2^32 and 64 bits above, so the
+dtype does not change the values, and `width` names it as the `u32` and `u64` fills of the C and
+CUDA ports do. A rejected draw retries on the fallback stream `split(g)` of `sub(0x424c573332)`
+(`0x424c573634` for 64 bits) from position 0, with `g` the index of the draw in the key's stream,
+so a fill cut at any element boundary equals the whole fill. The retry loop runs only when a
+draw was rejected. `maxval <= minval` gives `minval`. Bounded integers and uniforms are exact
+across ports. Normals agree to the tolerance of Appendix A. Neither equals `jax.random.normal`
+or `jax.random.randint`.
 
 `tj.sub(key, purpose)` is the purpose child for a purpose of up to 64 bits. `jax.random.fold_in`
 passes the implementation a 32-bit value, so it covers purposes below 2^32 only.
@@ -99,7 +102,7 @@ and `pixi run test` runs the tests.
 ## Tests
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
-of the spec repository's file, with a drift check in CI), checks `normal` and `randint` against the C and CUDA fixtures in `tests/cross_derived.json` (written by `tools/convert_c_fixtures.py`, rejections included), checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
+of the spec repository's file, with a drift check in CI), checks `normal` and `randint` against the C and CUDA fixtures in `tests/cross_derived.json` (written by `tools/convert_c_fixtures.py`, rejections included, fills from positions 0, 1 and 12345), checks that a bounded fill cut at any element equals the whole fill and that `int32` and `int64` agree for a small range, checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
 `jax.random.bits` with reference stream dumps in `tests/data`,
 fork children at traced positions, split children for indices up to 2^64 - 1 against a direct evaluation of F,
 and runs the key implementation under `jit` and `vmap`.
