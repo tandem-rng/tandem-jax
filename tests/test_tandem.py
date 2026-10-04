@@ -385,6 +385,30 @@ def test_normal_edge_cases():
         tj.normal(k, (2,), jnp.float16)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float64, jnp.float32])
+def test_normal_moments_and_ks(dtype):
+    # Bounds are five standard errors for the moments and the 0.1% KS critical value.
+    n = 10**7
+    z = np.array(tj.normal(tj.key(2026), (n,), dtype, 77), np.float64)
+    m, v = z.mean(), z.var()
+    skew, kurt = ((z - m) ** 3).mean() / v**1.5, ((z - m) ** 4).mean() / v**2 - 3
+    assert abs(m) < 5 / n**0.5 and abs(v - 1) < 5 * (2 / n) ** 0.5
+    assert abs(skew) < 5 * (6 / n) ** 0.5 and abs(kurt) < 5 * (24 / n) ** 0.5
+    cdf = np.array(jax.scipy.special.ndtr(jnp.sort(jnp.asarray(z))))
+    i = np.arange(1, n + 1)
+    assert max((i / n - cdf).max(), (cdf - (i - 1) / n).max()) < 1.95 / n**0.5
+
+
+def test_randint_uniform_through_rejections():
+    # Range 3 * 2^30 rejects a quarter of the draws, so the fallback supplies a quarter of the
+    # values. Chi-square over 1000 equal bins, bound at five standard deviations.
+    n, r, bins = 10**6, 3 * 2**30, 1000
+    x = np.array(tj.stream_randint(tj.key(9), 12345, n, 0, r, jnp.uint32)[0]).astype(np.uint64)
+    counts = np.bincount((x * bins // r).astype(np.int64), minlength=bins)
+    chi2 = ((counts - n / bins) ** 2 / (n / bins)).sum()
+    assert abs(chi2 - (bins - 1)) < 5 * (2 * (bins - 1)) ** 0.5
+
+
 @pytest.mark.parametrize("name, dtype", [("fill_below32", jnp.uint32), ("fill_below64", jnp.uint64)])
 def test_randint_matches_c_fills(name, dtype):
     k, w = tj.key(42), 32 if dtype == jnp.uint32 else 64

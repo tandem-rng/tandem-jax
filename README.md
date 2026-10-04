@@ -76,6 +76,8 @@ kids, pos = tj.fork(key, pos, 4)                   # the spec's fork, typed keys
 - `split`, `fork`, and `sub` against `tests/cross_port.json`, written by
   `tools/gen_split_fixture.c`.
 - Fills cut at any element equal the whole fill, under `jit` and `vmap`.
+- Normal moments to fourth order and a KS test on 10^7 draws, and chi-square uniformity of
+  bounded integers at a range that rejects a quarter of the draws.
 - With the CUDA extension, the kernels equal the XLA path on the CPU device.
 
 ## Speed
