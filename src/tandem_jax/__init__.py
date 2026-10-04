@@ -19,7 +19,7 @@ from jax.extend.random import define_prng_impl
 from . import _core
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
-__all__ = ["impl", "key", "key_data", "stream", "T", "F", "F_keyed", "whiten", "block", "fork"]
+__all__ = ["impl", "key", "key_data", "split", "stream", "T", "F", "F_keyed", "whiten", "block", "fork"]
 
 K = 32
 """The chunk length of the key implementation: the canonical Tandem8x32-K32."""
@@ -34,20 +34,39 @@ def _seed(seed):
     return whiten(seed, 0)
 
 
+def _words(x):
+    """Low and high uint32 words of an unsigned integer array of any width."""
+    x = jnp.asarray(x)
+    if x.dtype.itemsize == 8:
+        x = x.astype(jnp.uint64)
+        return x.astype(U32), (x >> jnp.uint64(32)).astype(U32)
+    return x.astype(U32), jnp.zeros(x.shape, U32)
+
+
+def _split_words(key, index):
+    """Child key words (..., 4) of the spec's split at an unsigned `index` array."""
+    if jnp.asarray(index).dtype.itemsize == 8:
+        index = jnp.asarray(index, jnp.uint64)
+        hidden, half = (index & jnp.uint64(1)).astype(U32), index >> jnp.uint64(1)
+    else:
+        index = jnp.asarray(index, U32)
+        hidden, half = index & U32(1), index >> U32(1)
+    lo, hi = _words(half)
+    return _core.child_keys(tuple(key), lo, hi, DOMAIN_SPLIT, 0, hidden)
+
+
 def _split(key, shape):
     n = math.prod(shape)
-    i = jnp.arange(n, dtype=U32)
-    children = _core.child_keys(tuple(key), i >> U32(1), jnp.zeros_like(i), DOMAIN_SPLIT, 0, i & U32(1))
-    return children.reshape(*shape, 4)
+    # Child indices past 2^32 need 64-bit arithmetic. Without x64 such a count cannot be
+    # indexed, so refuse rather than wrap around and repeat keys.
+    if n > 2**32 and not jax.config.jax_enable_x64:
+        raise ValueError(f"splitting into {n} keys needs jax_enable_x64, the index exceeds 32 bits")
+    i = jnp.arange(n, dtype=jnp.uint64 if n > 2**32 else U32)
+    return _split_words(key, i).reshape(*shape, 4)
 
 
 def _fold_in(key, data):
-    data = jnp.asarray(data)
-    if data.dtype.itemsize == 8:
-        data = data.astype(jnp.uint64)
-        lo, hi = data.astype(U32), (data >> jnp.uint64(32)).astype(U32)
-    else:
-        lo, hi = data.astype(U32), U32(0)
+    lo, hi = _words(data)
     o, _ = F_keyed(tuple(key), (lo, hi), DOMAIN_FOLD, 0)
     return jnp.stack(o)
 
@@ -88,6 +107,14 @@ def key(seed):
     """A typed key from an integer seed through the specification's seed whitening, so
     `key(42)` is the generator of Julia `Tandem8x32(42)` and C `tandem_seed(42, 0, 32)`."""
     return jax.random.key(seed, impl=impl)
+
+
+def split(k, index):
+    """The spec's split child `index` of a key: `half(index & 1)` of `F(key, index >> 1,
+    DOMAIN_SPLIT, 0)`. `index` is a scalar or array of any unsigned width, traced or not,
+    and the result is a typed key of the same shape. `jax.random.split(k, n)` gives
+    children `0..n-1`."""
+    return jax.random.wrap_key_data(_split_words(key_data(k), index), impl=impl)
 
 
 def key_data(k):

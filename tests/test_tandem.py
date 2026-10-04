@@ -157,3 +157,45 @@ def test_jit_and_vmap():
         assert np.array_equal(np.array(batched[i]), np.array(jax.random.bits(keys[i], (8,), jnp.uint32)))
     s = jax.jit(lambda k, p: tj.stream(k, p, 100, jnp.float64)[0])
     assert np.array_equal(np.array(s(k, 640)), np.array(tj.stream(k, 640, 100, jnp.float64)[0]))
+
+
+def _split_oracle(key_words, i):
+    o, h = tj.F_keyed(
+        tuple(key_words), (jnp.uint32((i >> 1) & 0xFFFFFFFF), jnp.uint32(i >> 33)), tj._core.DOMAIN_SPLIT, 0
+    )
+    return np.array(h if i & 1 else o)
+
+
+def test_split_by_index():
+    k = typed(KEY)
+    kids = tj.split(k, jnp.arange(2, dtype=jnp.uint64))
+    assert np.array_equal(np.array(jax.random.key_data(kids[0])), words(V["derived_keys"]["split_child_0"]))
+    assert np.array_equal(np.array(jax.random.key_data(kids[1])), words(V["derived_keys"]["split_child_1"]))
+    for i in (0, 1, 2**32 - 1, 2**32, 2**32 + 5, 2**40 + 7, 2**63 + 1, 2**64 - 1, 2**64 - 2):
+        got = jax.random.key_data(tj.split(k, jnp.uint64(i)))
+        assert np.array_equal(np.array(got), _split_oracle(KEY, i)), i
+
+
+def test_split_jit_array_and_raw_key():
+    f = jax.jit(tj.split)
+    idx = jnp.array([3, 2**33, 2**62 + 1], jnp.uint64)
+    got = jax.random.key_data(f(KEY, idx))
+    assert got.shape == (3, 4)
+    for g, i in zip(np.array(got), (3, 2**33, 2**62 + 1)):
+        assert np.array_equal(g, _split_oracle(KEY, i))
+    # jax.random.split children are split(0..n-1).
+    n = 9
+    a = jax.random.key_data(jax.random.split(typed(KEY), n))
+    b = jax.random.key_data(tj.split(KEY, jnp.arange(n, dtype=jnp.uint32)))
+    assert np.array_equal(np.array(a), np.array(b))
+    # A typed key from split is usable by jax.random.
+    jax.random.bits(tj.split(KEY, 5), (2,), jnp.uint32)
+
+
+def test_split_count_above_2_32():
+    # Lowering runs the impl's split on abstract values, so nothing of that size is allocated.
+    big = jax.jit(lambda k: jax.random.split(k, 2**32 + 2))
+    assert "ui64" in big.lower(typed(KEY)).as_text()
+    with jax.enable_x64(False):
+        with pytest.raises(ValueError, match="x64"):
+            jax.jit(lambda k: jax.random.split(k, 2**32 + 3)).lower(tj.key(1))
