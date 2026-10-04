@@ -1,7 +1,7 @@
 """Tandem8x32 for JAX: a `jax.random` key implementation and positioned stream draws.
 
-`key(seed)` is a typed JAX key whose `jax.random.bits`, `split` and `fold_in` follow the
-specification: bits are the stream from position 0, `split` is the spec's split by index,
+`key(seed, chunk_length=32)` is a typed JAX key whose `jax.random.bits`, `split` and
+`fold_in` follow the specification: bits are the stream from position 0, `split` is the spec's split by index,
 `fold_in` the spec's purpose derivation. `stream(key, position, n, dtype)` reads the stream
 at a bit position with the spec's own float mappings, and `uniform` wraps it in the call shape
 of `jax.random.uniform`. `jax.random.uniform` applies JAX's own mapping (52 random bits for
@@ -9,6 +9,7 @@ float64, 23 for float32), so it does not equal the spec's Float64 and Float32 dr
 `uniform` or `stream` for those.
 """
 
+import functools
 import math
 
 import jax
@@ -20,10 +21,13 @@ from jax.extend.random import define_prng_impl
 from . import _core
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
-__all__ = ["impl", "key", "key_data", "split", "stream", "uniform", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
+__all__ = ["impl", "impl_for", "key", "key_data", "split", "stream", "uniform", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
 
 K = 32
-"""The chunk length of the key implementation: the canonical Tandem8x32-K32."""
+"""The chunk length of the default key implementation: the canonical Tandem8x32-K32."""
+
+_CHUNK_LENGTH = {}
+"""Chunk length by implementation tag, so stream reads follow the key's own variant."""
 
 
 def _seed(seed):
@@ -87,41 +91,58 @@ def _elements(words, bit_width, n):
     return parts.reshape(-1)[:n].astype(jnp.dtype(f"uint{max(bit_width, 8)}"))
 
 
-def _random_bits(key, bit_width, shape):
-    n = math.prod(shape)
-    n_words = (n * bit_width + 31) // 32
-    words = _core.words_from(tuple(key), 0, n_words, K)
-    return _elements(words, bit_width, n).reshape(shape)
+@functools.cache
+def impl_for(chunk_length):
+    """The key implementation of Tandem8x32-K`chunk_length`, a power of two from 1 to 65536.
+    `impl_for(32)` is `impl`. The variants differ only in how `random_bits` and `stream`
+    lay out the stream: split, fold_in and seeding do not depend on K, and children keep
+    the parent's implementation."""
+    K = int(chunk_length)
+    if not 1 <= K <= 65536 or K & (K - 1):
+        raise ValueError(f"chunk length must be a power of two from 1 to 65536, got {chunk_length}")
+
+    def random_bits(key, bit_width, shape):
+        n = math.prod(shape)
+        n_words = (n * bit_width + 31) // 32
+        words = _core.words_from(tuple(key), 0, n_words, K)
+        return _elements(words, bit_width, n).reshape(shape)
+
+    name, tag = ("tandem8x32", "tdm") if K == 32 else (f"tandem8x32-K{K}", f"tdm{K}")
+    _CHUNK_LENGTH[tag] = K
+    return define_prng_impl(
+        key_shape=(4,), seed=_seed, split=_split, random_bits=random_bits, fold_in=_fold_in, name=name, tag=tag
+    )
 
 
-impl = define_prng_impl(
-    key_shape=(4,),
-    seed=_seed,
-    split=_split,
-    random_bits=_random_bits,
-    fold_in=_fold_in,
-    name="tandem8x32",
-    tag="tdm",
-)
+impl = impl_for(K)
 
 
-def key(seed):
+def key(seed, chunk_length=K):
     """A typed key from an integer seed through the specification's seed whitening, so
-    `key(42)` is the generator of Julia `Tandem8x32(42)` and C `tandem_seed(42, 0, 32)`."""
-    return jax.random.key(seed, impl=impl)
+    `key(42)` is the generator of Julia `Tandem8x32(42)` and C `tandem_seed(42, 0, 32)`.
+    `chunk_length` selects the variant Tandem8x32-K`chunk_length`."""
+    return jax.random.key(seed, impl=impl_for(chunk_length))
 
 
 def split(k, index):
     """The spec's split child `index` of a key: `half(index & 1)` of `F(key, index >> 1,
     DOMAIN_SPLIT, 0)`. `index` is a scalar or array of any unsigned width, traced or not,
-    and the result is a typed key of the same shape. `jax.random.split(k, n)` gives
+    and the result is a typed key of the same shape and variant. `jax.random.split(k, n)` gives
     children `0..n-1`."""
-    return jax.random.wrap_key_data(_split_words(key_data(k), index), impl=impl)
+    return jax.random.wrap_key_data(_split_words(key_data(k), index), impl=impl_for(_chunk_length(k)))
+
+
+def _is_typed(k):
+    return jnp.issubdtype(jnp.asarray(k).dtype, jax.dtypes.prng_key)
+
+
+def _chunk_length(k):
+    return _CHUNK_LENGTH.get(str(jax.random.key_impl(k)), K) if _is_typed(k) else K
 
 
 def key_data(k):
     """The four key words of a typed key, or a (4,) uint32 array passed through."""
-    if jnp.issubdtype(jnp.asarray(k).dtype, jax.dtypes.prng_key):
+    if _is_typed(k):
         return jax.random.key_data(k)
     return jnp.asarray(k, U32)
 
@@ -151,11 +172,14 @@ def _to_float(raw, dtype):
     return (raw >> jnp.uint16(5)).astype(jnp.float32).astype(dtype) * dtype.type(2.0**-11)
 
 
-def stream(k, position, n, dtype=jnp.float64, chunk_length=K):
+def stream(k, position, n, dtype=jnp.float64, chunk_length=None):
     """`n` draws of `dtype` from stream bit `position`, with the spec's alignment and
     mappings: bool is one bit, signed integers reinterpret the unsigned draw, floats use
     the spec's scaling, and complex draws alternate real and imaginary components of the
-    matching float type. Returns the draws and the position after them."""
+    matching float type. Returns the draws and the position after them. `chunk_length`
+    defaults to the variant of a typed key and to 32 for raw key words."""
+    if chunk_length is None:
+        chunk_length = _chunk_length(k)
     dtype = jnp.dtype(dtype)
     if jnp.issubdtype(dtype, jnp.complexfloating):
         part = jnp.dtype("float32" if dtype == jnp.complex64 else "float64")
@@ -231,4 +255,4 @@ def fork(k, position, n):
     """The `n` fork children of a key at a bit position as a typed key array of shape
     (n,), and the parent's new position. Works under `jit` with a traced position."""
     kids, new_position = fork_words(k, position, n)
-    return jax.random.wrap_key_data(kids, impl=impl), new_position
+    return jax.random.wrap_key_data(kids, impl=impl_for(_chunk_length(k))), new_position

@@ -19,6 +19,7 @@ step_key = jax.random.fold_in(key, 7)              # the spec's purpose 7
 z = jax.random.normal(k1, (1000,))                 # any jax.random function
 bits = jax.random.bits(key, (16,), jnp.uint32)     # the stream words from position 0
 
+key8 = tj.key(42, chunk_length=8)                  # the Tandem8x32-K8 variant
 kid = tj.split(key, 2**40 + 5)                     # the spec's split child for any unsigned 64-bit index
 u = tj.uniform(key, (1000,), jnp.float32)          # like jax.random.uniform, with the spec's mapping
 x, pos = tj.stream(key, 0, 2**20, jnp.float64)     # the spec's Float64 draws, and the position after
@@ -52,8 +53,11 @@ and `float64`, returns `bool` as single bits, returns the signed integer types b
 reinterpreting the unsigned draw in two's complement, returns the unsigned types as the raw
 aligned words, and returns `complex64` and `complex128` as alternating real and imaginary
 `float32` or `float64` draws. The key
-implementation is the canonical `Tandem8x32-K32`. `stream` takes `chunk_length` for the
-other variants.
+implementation `tj.impl` is the canonical `Tandem8x32-K32`.
+`tj.impl_for(K)` gives the implementation of `Tandem8x32-K<K>` for a power of two from 1 to
+65536, and `tj.key(seed, chunk_length=K)` makes a typed key of that variant. Children from
+`split`, `fork` and `stream` follow the parent's variant, and `stream` takes `chunk_length`
+for raw key words.
 
 64-bit types need `jax.config.update("jax_enable_x64", True)`. Without it the 32-bit
 multiplies are built from 16-bit halves, which also serves backends without 64-bit integers.
@@ -70,7 +74,7 @@ and `pixi run test` runs the tests.
 ## Tests
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
-of the spec repository's file, with a drift check in CI), checks `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
+of the spec repository's file, with a drift check in CI), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
 `jax.random.bits` with reference stream dumps in `tests/data`,
 fork children at traced positions, split children for indices up to 2^64 - 1 against a direct evaluation of F,
 and runs the key implementation under `jit` and `vmap`.

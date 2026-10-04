@@ -292,3 +292,29 @@ def test_complex_stream_matches_dump(name, dtype):
     # A complex draw is a real fill of twice the length, aligned to the component width.
     _, after_byte = tj.stream(k, 8, 3, dtype)
     assert int(after_byte) == ((8 + w - 1) & ~(w - 1)) + 6 * w
+
+
+def test_chunk_length_variants():
+    want = dump("k1234_K8_u32.bin", np.uint32)
+    k8 = jax.random.wrap_key_data(KEY1234, impl=tj.impl_for(8))
+    assert tj.impl_for(8) is tj.impl_for(8) and tj.impl_for(32) is tj.impl
+    assert np.array_equal(np.array(jax.random.bits(k8, (len(want),), jnp.uint32)), want)
+    # A typed key carries its variant into stream, including under jit, and into its children.
+    assert np.array_equal(np.array(tj.stream(k8, 0, len(want), jnp.uint32)[0]), want)
+    assert np.array_equal(np.array(jax.jit(lambda k: tj.stream(k, 0, 1000, jnp.uint32)[0])(k8)), want[:1000])
+    assert not np.array_equal(np.array(tj.stream(typed(KEY1234), 0, 1000, jnp.uint32)[0]), want[:1000])
+    child = jax.random.split(k8)[0]
+    assert np.array_equal(
+        np.array(jax.random.bits(child, (500,), jnp.uint32)),
+        np.array(tj.stream(jax.random.key_data(child), 0, 500, jnp.uint32, chunk_length=8)[0]),
+    )
+    assert tj.fork(k8, 0, 2)[0].dtype == k8.dtype and tj.split(k8, 3).dtype == k8.dtype
+    # Every variant shares seeding, split and fold_in.
+    k1, k2 = tj.key(42, 8), tj.key(42)
+    assert np.array_equal(np.array(jax.random.key_data(k1)), np.array(jax.random.key_data(k2)))
+    for c in (1, 2, 64, 1024, 65536):
+        a = jax.random.bits(tj.key(42, c), (3000,), jnp.uint32)
+        assert np.array_equal(np.array(a), np.array(tj.stream(jax.random.key_data(tj.key(42, c)), 0, 3000, jnp.uint32, chunk_length=c)[0]))
+    for bad in (0, 3, 131072, -8):
+        with pytest.raises(ValueError, match="power of two"):
+            tj.impl_for(bad)
