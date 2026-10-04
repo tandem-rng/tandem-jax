@@ -20,6 +20,7 @@ z = jax.random.normal(k1, (1000,))                 # any jax.random function
 bits = jax.random.bits(key, (16,), jnp.uint32)     # the stream words from position 0
 
 kid = tj.split(key, 2**40 + 5)                     # the spec's split child for any unsigned 64-bit index
+u = tj.uniform(key, (1000,), jnp.float32)          # like jax.random.uniform, with the spec's mapping
 x, pos = tj.stream(key, 0, 2**20, jnp.float64)     # the spec's Float64 draws, and the position after
 y, pos = tj.stream(key, pos, 100, jnp.uint8)       # continue at that position, aligned per the spec
 kids, pos = tj.fork(key, pos, 4)                   # the spec's fork at the current block, typed keys, jit-safe
@@ -42,7 +43,10 @@ alignment, so `bits(key, shape, uint32)` are the stream words and `uint8`, `uint
 
 `jax.random.uniform` applies JAX's own bit mapping: 52 random bits for `float64` and 23 for
 `float32`. The specification keeps 53 and 24, as `(raw >> 11) * 2**-53` and
-`(raw >> 8) * 2**-24`, so `uniform` does not equal the specification's Float64 draws.
+`(raw >> 8) * 2**-24`, so `jax.random.uniform` does not equal the specification's Float64 draws.
+`tj.uniform(key, shape, dtype, position=0, *, minval, maxval)` is the drop-in with the
+specification's mapping, including `float16` as `(raw >> 5) * 2**-11`. It reads from the stream
+at `position` and returns the array only.
 `tj.stream(key, position, n, dtype)` applies the spec's mappings for `float16`, `float32`
 and `float64`, and returns the raw aligned words for the unsigned integer types. The key
 implementation is the canonical `Tandem8x32-K32`. `stream` takes `chunk_length` for the
@@ -63,7 +67,7 @@ and `pixi run test` runs the tests.
 ## Tests
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
-of the spec repository's file, with a drift check in CI), compares positioned reads and
+of the spec repository's file, with a drift check in CI), checks `uniform` against the float dumps, compares positioned reads and
 `jax.random.bits` with reference stream dumps in `tests/data`,
 fork children at traced positions, split children for indices up to 2^64 - 1 against a direct evaluation of F,
 and runs the key implementation under `jit` and `vmap`.

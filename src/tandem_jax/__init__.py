@@ -3,9 +3,10 @@
 `key(seed)` is a typed JAX key whose `jax.random.bits`, `split` and `fold_in` follow the
 specification: bits are the stream from position 0, `split` is the spec's split by index,
 `fold_in` the spec's purpose derivation. `stream(key, position, n, dtype)` reads the stream
-at a bit position with the spec's own float mappings. `jax.random.uniform` applies JAX's own
-mapping (52 random bits for float64, 23 for float32), so it does not equal the spec's
-Float64 and Float32 draws; use `stream` for those.
+at a bit position with the spec's own float mappings, and `uniform` wraps it in the call shape
+of `jax.random.uniform`. `jax.random.uniform` applies JAX's own mapping (52 random bits for
+float64, 23 for float32), so it does not equal the spec's Float64 and Float32 draws; use
+`uniform` or `stream` for those.
 """
 
 import math
@@ -19,7 +20,7 @@ from jax.extend.random import define_prng_impl
 from . import _core
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
-__all__ = ["impl", "key", "key_data", "split", "stream", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
+__all__ = ["impl", "key", "key_data", "split", "stream", "uniform", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
 
 K = 32
 """The chunk length of the key implementation: the canonical Tandem8x32-K32."""
@@ -162,6 +163,22 @@ def stream(k, position, n, dtype=jnp.float64, chunk_length=K):
         raw = _elements(words, w, n)
     out = _to_float(raw, dtype) if jnp.issubdtype(dtype, jnp.floating) else raw
     return out, aligned + w * n
+
+
+def uniform(k, shape=(), dtype=None, position=0, *, minval=0.0, maxval=1.0):
+    """Uniform draws of `shape` with the spec's float mappings, `(raw >> 11) * 2**-53` for
+    float64, `(raw >> 8) * 2**-24` for float32 and `(raw >> 5) * 2**-11` for float16, read
+    from stream bit `position`. Same call shape as `jax.random.uniform`, which applies
+    JAX's own mapping and so returns different values. `dtype` defaults to the JAX float
+    default. The result lies in [minval, maxval) up to rounding, as in JAX. Returns the
+    array only, so use `stream` when the next position is needed."""
+    dtype = jnp.dtype(dtype if dtype is not None else jnp.float64 if jax.config.jax_enable_x64 else jnp.float32)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        raise ValueError(f"uniform needs a floating dtype, got {dtype}")
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    x = stream(k, position, math.prod(shape), dtype)[0].reshape(shape)
+    minval, maxval = jnp.asarray(minval, dtype), jnp.asarray(maxval, dtype)
+    return jnp.maximum(minval, x * (maxval - minval) + minval)
 
 
 def block(k, c, j):

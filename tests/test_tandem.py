@@ -225,3 +225,30 @@ def test_fork_typed_jit_and_traced_position():
     jax.random.bits(kids[0], (2,), jnp.uint32)
     assert np.array_equal(np.array(tj.fork_words(KEY, 5000, 5)[0]), np.array(jax.random.key_data(f(k, 5000)[0])))
     assert tj.fork(k, 0, 0)[0].shape == (0,) and int(tj.fork(k, 0, 0)[1]) == 128
+
+
+@pytest.mark.parametrize("name, dtype", [("seed42_K32_f64.bin", jnp.float64), ("seed42_K32_f32.bin", jnp.float32)])
+def test_uniform_matches_dumps(name, dtype):
+    want = dump(name, np.dtype(dtype))
+    k = tj.key(42)
+    got = tj.uniform(k, (len(want),), dtype)
+    assert got.dtype == np.dtype(dtype) and np.array_equal(np.array(got), want)
+    w = np.dtype(dtype).itemsize * 8
+    assert np.array_equal(np.array(tj.uniform(k, (4, 5), dtype, 7 * w)), want[7:27].reshape(4, 5))
+    assert np.array_equal(np.array(tj.uniform(k, 50, dtype, 13 * w)), want[13:63])
+    f = jax.jit(lambda k, p: tj.uniform(k, (50,), dtype, p))
+    assert np.array_equal(np.array(f(k, jnp.uint64(13 * w))), want[13:63])
+
+
+def test_uniform_dtypes_range_and_jax_difference():
+    k = tj.key(42)
+    assert tj.uniform(k).shape == () and tj.uniform(k, (3,)).dtype == jnp.float64
+    h = tj.uniform(k, (1000,), jnp.float16)
+    assert h.dtype == jnp.float16 and float(h.min()) >= 0 and float(h.max()) < 1
+    x = tj.uniform(k, (1000,), jnp.float64, minval=-2.0, maxval=3.0)
+    assert float(x.min()) >= -2 and float(x.max()) < 3
+    base = tj.uniform(k, (1000,), jnp.float64)
+    assert np.array_equal(np.array(x), np.array(jnp.maximum(-2.0, base * 5.0 - 2.0)))
+    assert not np.array_equal(np.array(jax.random.uniform(k, (16,), jnp.float64)), np.array(tj.uniform(k, (16,), jnp.float64)))
+    with pytest.raises(ValueError):
+        tj.uniform(k, (2,), jnp.uint32)
