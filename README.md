@@ -110,6 +110,8 @@ best of seven runs, GiB/s of output. `jax.random` uses the default threefry2x32 
 | randint int32 in [0, 1000) | 27 | 1216 | 329 |
 | randint int64 in [0, 1000) | 27 | 1277 | 567 |
 
+Longer notes on use, install, tests, and speed are in [docs/notes.md](docs/notes.md).
+
 ## AI assistance
 
 This port was written with the help of large language models under human
