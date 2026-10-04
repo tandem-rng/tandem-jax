@@ -512,3 +512,61 @@ def test_randint_matches_cuda_fills_at_nonzero_starts(name, dtype, w):
             # Width from the range: an int64 result type must not change a 32-bit draw.
             auto = tj.stream_randint(k, c["start"], 64, 0, c["range"], jnp.int64)[0]
             assert np.array_equal(np.array(auto).astype(np.uint64), want.astype(np.uint64)), c
+
+
+CUDA = jax.default_backend() == "gpu" and tj._ffi.tandem_jax_cuda is not None
+cuda_only = pytest.mark.skipif(not CUDA, reason="needs a CUDA device and the tandem_jax_cuda extension")
+
+
+def _run_on(device, f, *args):
+    with jax.default_device(device):
+        return np.array(jax.jit(f)(*(jax.device_put(a, device) for a in args)))
+
+
+@cuda_only
+@pytest.mark.parametrize("K", [8, 32])
+def test_cuda_kernels_equal_the_xla_path(K):
+    # Odd, unaligned and 2^33-bit starts and fills over many thread blocks exercise the geometry
+    # the kernels derive on the device, and the fallback keys of rejected draws far into the stream.
+    gpu, cpu = jax.devices("gpu")[0], jax.devices("cpu")[0]
+    kd = tj.key_data(tj.key(77))
+    typed = lambda kd: jax.random.wrap_key_data(kd, impl=tj.impl_for(K))
+    draws = [(lambda d: lambda kd, p, n: tj.stream(typed(kd), p, n, d)[0])(d) for d in ("uint32", "int32", "float32", "uint64", "int64", "float64")]
+    normals = [(lambda d: lambda kd, p, n: tj.stream_normal(typed(kd), p, n, d)[0])(d) for d in ("float32", "float64")]
+    bounded = [
+        (lambda a, b, d, w: lambda kd, p, n: tj.stream_randint(typed(kd), p, n, a, b, d, w)[0])(*c)
+        for c in ((0, 1000, "int32", None), (-7, 2**31 + 1, "int64", None), (0, 2**32, "int64", None), (3, 2**40, "int64", None),
+                  (0, 2**63 + 1, "uint64", None), (5, 5, "int32", None), (-9, 1000, "int32", 64), (3, 250, "uint8", None))
+    ]
+    for n in (7, 70001):
+        for i, f in enumerate(draws + normals + bounded):
+            g = lambda kd, p: f(kd, p, n)
+            for p in (0, 1, 12345, 2**33 + 7):
+                got, want = _run_on(gpu, g, kd, jnp.uint64(p)), _run_on(cpu, g, kd, jnp.uint64(p))
+                if f in normals:
+                    close(got, want, want.dtype.type, ulps32=16)
+                else:
+                    assert np.array_equal(got, want), (i, n, p)
+
+
+@cuda_only
+def test_cuda_kernels_batch_under_vmap():
+    keys = jax.random.split(tj.key(5), 3)
+    pos = jnp.array([0, 33, 2**33 + 1], jnp.uint64)
+    for f in (
+        lambda k, p: tj.stream(k, p, 1001, jnp.float32)[0],
+        lambda k, p: tj.stream_normal(k, p, 1001, jnp.float64)[0],
+        lambda k, p: tj.stream_randint(k, p, 1001, -3, 2**31 + 1, jnp.int64)[0],
+    ):
+        batched = np.array(jax.jit(jax.vmap(f))(keys, pos))
+        for i in range(3):
+            assert np.array_equal(batched[i], np.array(f(keys[i], pos[i])))
+
+
+@cuda_only
+def test_cuda_lowers_to_the_kernels_and_cpu_to_xla():
+    k = tj.key(1)
+    f = lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))
+    assert jax.jit(f).lower().compile().as_text().count('custom_call_target="tandem_fill"') == 4
+    with jax.default_device(jax.devices("cpu")[0]):
+        assert "tandem_fill" not in jax.jit(f).lower().compile().as_text()

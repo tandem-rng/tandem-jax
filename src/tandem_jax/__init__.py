@@ -18,7 +18,7 @@ import numpy as np
 from jax import lax
 from jax.extend.random import define_prng_impl
 
-from . import _core
+from . import _core, _ffi
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
 __all__ = ["impl", "impl_for", "key", "key_data", "split", "sub", "stream", "uniform", "stream_normal", "normal", "stream_randint", "randint", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
@@ -197,25 +197,31 @@ def stream(k, position, n, dtype=jnp.float64, chunk_length=None):
     if dtype not in _WIDTH:
         raise TypeError(f"stream does not support dtype {dtype}")
     w = _WIDTH[dtype]
-    position = jnp.asarray(position, jnp.uint64 if jax.config.jax_enable_x64 else U32)
-    aligned = (position + (w - 1)) & ~jnp.asarray(w - 1, position.dtype)
-    # Elements narrower than a word may start inside the first word; read from its start.
-    n_words = (n * w + 31) // 32 + (1 if w < 32 else 0)
-    words = _core.words_from(key_data(k), aligned & ~jnp.asarray(31, position.dtype), n_words, chunk_length)
-    if w < 32:
-        offset = ((aligned & 31) // w).astype(jnp.int32)
-        per = 32 // w
-        raw = lax.dynamic_slice(_elements(words, w, n_words * per), (offset,), (n,))
-    else:
-        raw = _elements(words, w, n)
-    if jnp.issubdtype(dtype, jnp.floating):
-        out = _to_float(raw, dtype)
-    elif dtype == jnp.bool_:
-        out = raw != 0
-    elif jnp.issubdtype(dtype, jnp.signedinteger):
-        out = lax.bitcast_convert_type(raw, dtype)
-    else:
-        out = raw
+    position = _position(position)
+    aligned = _align(position, w)
+    key = key_data(k)
+
+    def xla():
+        # Elements narrower than a word may start inside the first word; read from its start.
+        n_words = (n * w + 31) // 32 + (1 if w < 32 else 0)
+        words = _core.words_from(key, aligned & ~jnp.asarray(31, position.dtype), n_words, chunk_length)
+        if w < 32:
+            offset = ((aligned & 31) // w).astype(jnp.int32)
+            per = 32 // w
+            raw = lax.dynamic_slice(_elements(words, w, n_words * per), (offset,), (n,))
+        else:
+            raw = _elements(words, w, n)
+        if jnp.issubdtype(dtype, jnp.floating):
+            return _to_float(raw, dtype)
+        if dtype == jnp.bool_:
+            return raw != 0
+        if jnp.issubdtype(dtype, jnp.signedinteger):
+            return lax.bitcast_convert_type(raw, dtype)
+        return raw
+
+    # The kernels write 32- and 64-bit draws as the dtype; narrower ones come from the word fill.
+    supported = w >= 32 and n > 0 and chunk_length >= _ffi.TILE_STEPS
+    out = _ffi.on_cuda(supported, lambda: _ffi.fill(key, aligned, n, dtype, chunk_length, "stream"), xla)
     return out, aligned + w * n
 
 
@@ -231,6 +237,9 @@ def uniform(k, shape=(), dtype=None, position=0, *, minval=0.0, maxval=1.0):
         raise ValueError(f"uniform needs a floating dtype, got {dtype}")
     shape = (shape,) if isinstance(shape, int) else tuple(shape)
     x = stream(k, position, math.prod(shape), dtype)[0].reshape(shape)
+    # On [0, 1) the map below is the identity, and XLA would still spend a pass over x on it.
+    if isinstance(minval, (int, float)) and isinstance(maxval, (int, float)) and (minval, maxval) == (0, 1):
+        return x
     minval, maxval = jnp.asarray(minval, dtype), jnp.asarray(maxval, dtype)
     return jnp.maximum(minval, x * (maxval - minval) + minval)
 
@@ -292,6 +301,10 @@ def _position(position):
     return jnp.asarray(position, jnp.uint64 if jax.config.jax_enable_x64 else U32)
 
 
+def _align(position, w):
+    return (position + (w - 1)) & ~jnp.asarray(w - 1, position.dtype)
+
+
 def stream_normal(k, position, n, dtype=None):
     """`n` standard normals from stream bit `position` by Box-Muller, and the position after
     them. Pair `j` is elements `2j` and `2j + 1`, `(r cos 2 pi b, r sin 2 pi b)` with
@@ -308,8 +321,15 @@ def stream_normal(k, position, n, dtype=None):
 
 @functools.partial(jax.jit, static_argnames=("n", "dtype", "chunk"))
 def _normal(key, position, n, dtype, chunk):
-    # One jit so the uniforms, log, sqrt, sin and cos fuse into one pass over the output.
-    u, pos = stream(key, position, 2 * ((n + 1) // 2), dtype, chunk)
+    draws = 2 * ((n + 1) // 2)
+    pos = _align(position, 8 * dtype.itemsize) + 8 * dtype.itemsize * draws
+    cuda = lambda: _ffi.fill(key, position, n, dtype, chunk, "normal")
+    return _ffi.on_cuda(True, cuda, lambda: _box_muller(key, position, draws, dtype, chunk)[:n]), pos
+
+
+def _box_muller(key, position, draws, dtype, chunk):
+    # Traced under _normal's jit, so the uniforms, log, sqrt, sin and cos fuse into one pass.
+    u, _ = stream(key, position, draws, dtype, chunk)
     a, b = u[0::2], u[1::2]
     r = jnp.sqrt(-2 * jnp.log(1 - a))
     # Reduce to a quadrant and an angle in [-1/8, 1/8] of a turn first: b - q / 4 is exact, so
@@ -322,7 +342,7 @@ def _normal(key, position, n, dtype, chunk):
     q = q & 3
     c = jnp.where(q == 0, c0, jnp.where(q == 1, -s0, jnp.where(q == 2, -c0, s0)))
     s = jnp.where(q == 0, s0, jnp.where(q == 1, c0, jnp.where(q == 2, -s0, -c0)))
-    return jnp.stack([r * c, r * s], axis=-1).reshape(-1)[:n], pos
+    return jnp.stack([r * c, r * s], axis=-1).reshape(-1)
 
 
 def normal(k, shape=(), dtype=None, position=0):
@@ -454,17 +474,35 @@ def stream_randint(k, position, n, minval, maxval, dtype=None, width=None):
         return jnp.zeros(0, dtype), _position(position)
     if width not in (None, 32, 64):
         raise ValueError(f"width must be 32 or 64, got {width}")
-    if width is not None or wide.itemsize == 4:
-        val, pos = _bounded(k, position, n, lo, r, width or 32)
-    else:
-        wide_range = r.max() > wide.type(2**32)
-        try:
-            val, pos = _bounded(k, position, n, lo, r, 64 if bool(wide_range) else 32)
-        except jax.errors.TracerBoolConversionError:
-            val, pos = lax.cond(
-                wide_range, lambda: _bounded(k, position, n, lo, r, 64), lambda: _bounded(k, position, n, lo, r, 32)
-            )
-    return val.astype(dtype), pos
+
+    def xla():
+        if width is not None or wide.itemsize == 4:
+            val, pos = _bounded(k, position, n, lo, r, width or 32)
+        else:
+            wide_range = r.max() > wide.type(2**32)
+            try:
+                val, pos = _bounded(k, position, n, lo, r, 64 if bool(wide_range) else 32)
+            except jax.errors.TracerBoolConversionError:
+                val, pos = lax.cond(
+                    wide_range, lambda: _bounded(k, position, n, lo, r, 64), lambda: _bounded(k, position, n, lo, r, 32)
+                )
+        return val.astype(dtype), pos
+
+    def cuda():
+        # Width 0 leaves the choice to the kernel, which reads the range, so no conditional runs.
+        w = width or (32 if wide.itemsize == 4 else 0)
+        # The kernels store 32- or 64-bit outputs at least as wide as the draw.
+        size = max(w, 32)
+        out = dtype if dtype.itemsize * 8 >= size else jnp.dtype(("int" if dtype.kind == "i" else "uint") + str(size))
+        p = _position(position)
+        val = _ffi.fill(key_data(k), p, n, out, _chunk_length(k), "below", r, lo, w).astype(dtype)
+        if w:
+            return val, _align(p, w) + w * n
+        return val, jnp.where(r > wide.type(2**32), _align(p, 64) + 64 * n, _align(p, 32) + 32 * n)
+
+    # Per-element bounds take the XLA path, the kernels take one range per fill.
+    supported = jnp.ndim(lo) == 0 and jnp.ndim(r) == 0 and _chunk_length(k) >= _ffi.TILE_STEPS
+    return _ffi.on_cuda(supported, cuda, xla)
 
 
 def randint(k, shape, minval, maxval, dtype=None, position=0, width=None):

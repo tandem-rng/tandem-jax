@@ -1,0 +1,15 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "jaxlib>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tandem-jax-cuda"
+version = "0.1.0"
+description = "The tandem-cuda fills as an XLA FFI handler, for tandem-jax on NVIDIA GPUs"
+license = "Apache-2.0"
+authors = [{name = "Jessica Cox"}]
+requires-python = ">=3.11"
+dependencies = ["jax>=0.10"]
+
+[tool.scikit-build]
+wheel.packages = ["src/tandem_jax_cuda"]

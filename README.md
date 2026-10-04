@@ -4,8 +4,9 @@
 
 JAX key implementation of [Tandem8x32](https://github.com/tandem-rng/spec), a noncryptographic
 pseudorandom number generator built to be fast on CPUs and GPUs alike. Pure Python over
-`jax.numpy` and `jax.lax`, so it runs on every XLA backend. It produces the stream the
-specification defines, bit for bit.
+`jax.numpy` and `jax.lax`, so it runs on every XLA backend. On NVIDIA GPUs an optional extension
+runs the [tandem-cuda](https://github.com/tandem-rng/tandem-cuda) kernels instead. It produces
+the stream the specification defines, bit for bit.
 
 ## Use
 
@@ -99,13 +100,43 @@ pip install .
 For development, `pixi install` creates an environment with the package installed editable,
 and `pixi run test` runs the tests.
 
+### CUDA kernels
+
+The package in `cuda/` builds the tandem-cuda fills as an XLA FFI handler. It needs the CUDA
+toolkit (`nvcc`, of the major version of your `jax[cuda]` install and no newer than the driver
+supports) and CMake 3.24 or later. Build it against the installed `jaxlib`:
+
+```sh
+pip install "jax[cuda12]" scikit-build-core
+pip install --no-build-isolation ./cuda
+```
+
+The build targets every major GPU architecture. Add
+`-C cmake.define.CMAKE_CUDA_ARCHITECTURES=80` (an A100, for example) to build for one only.
+`tandem_jax` loads the extension on import when it is installed. On a CUDA device, `stream`,
+`uniform`, `normal`, `randint`, their `stream_*` forms and the `jax.random` functions on a Tandem
+key then run on the kernels. `lax.platform_dependent` makes the choice when XLA lowers the code, so a
+CPU device in the same program keeps the XLA path. The kernels write 32- and 64-bit draws
+directly. Narrower dtypes come from the 32-bit word fill and one XLA pass. They need a chunk
+length of 8 or more, and `randint` with per-element bounds keeps the XLA path. `jit` and `vmap`
+work: a batch of keys or positions runs as one kernel launch. The values are the XLA path's: bit
+for bit for the stream, uniforms and bounded integers, and within the tolerance of Appendix A for
+normals. The `float32` normals use the fast `__sincosf` of tandem-cuda, within 16 ulps + 1e-6.
+
+The headers in `cuda/include` are those of tandem-cuda commit `b65745a`. Its fills give the
+same values as commit `5806e51`, the first with the global draw index in the bounded fallback.
+
 ## Tests
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
 of the spec repository's file, with a drift check in CI), checks `normal` and `randint` against the C and CUDA fixtures in `tests/cross_derived.json` (written by `tools/convert_c_fixtures.py`, rejections included, fills from positions 0, 1 and 12345, from both C and CUDA), checks that a bounded fill cut at any element equals the whole fill and that `int32` and `int64` agree for a small range, checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
 `jax.random.bits` with reference stream dumps in `tests/data`,
 fork children at traced positions, split children for indices up to 2^64 - 1 against a direct evaluation of F,
-and runs the key implementation under `jit` and `vmap`.
+and runs the key implementation under `jit` and `vmap`. On a CUDA device with the extension, the
+whole suite runs on the kernels, and three more tests check that the kernels equal the XLA path
+on the CPU device for every fill at odd, unaligned and 2^33-bit starts and over many thread
+blocks, that a `vmap` batch equals its rows, and that a GPU lowering calls the kernels while a
+CPU lowering does not.
 
 ## Speed
 
@@ -139,11 +170,6 @@ NVIDIA A100 (one GPU of two, idle), CUDA 12 `jaxlib` 0.11.2 with driver 570, `ja
 | normal float64 | 27 | 139 | 110 |
 | randint int32 in [0, 1000) | 27 | 165 | 172 |
 | randint int64 in [0, 1000) | 27 | 243 | 317 |
-
-On a GPU backend the stream rows come from one Pallas kernel (`src/tandem_jax/_gpu.py`) that
-keeps the chunk state in registers and writes each block once. Without it XLA writes the state of
-every step to memory, and the same draws run two to four times slower. JAX marks the Pallas
-Triton backend as deprecated, so a future JAX release may need the kernel ported.
 
 ## AI assistance
 

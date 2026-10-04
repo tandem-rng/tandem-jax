@@ -103,11 +103,7 @@ def rows(key, group0, ngroups, K):
     """Stream words of `ngroups` groups from `group0` at chunk length `K`, as a flat array
     in stream order: row by row, eight 128-bit blocks per row. The array may extend past the
     last group."""
-    from . import _gpu
-
     c = jnp.asarray(8 * group0, jnp.uint64 if jax.config.jax_enable_x64 else U32)
-    if _gpu.available():
-        return _gpu.rows(key, c, ngroups, K)
     c = c + jnp.arange(8 * ngroups, dtype=c.dtype)
     if c.dtype == jnp.uint64:
         counter = (c.astype(U32), (c >> jnp.uint64(32)).astype(U32))
@@ -127,10 +123,16 @@ def rows(key, group0, ngroups, K):
 
 def words_from(key, bit_position, n_words, K=32):
     """`n_words` uint32 stream words from a 32-bit aligned `bit_position` (static `n_words`)."""
-    word0 = bit_position >> 5
-    row0 = word0 >> 5
-    group0 = row0 // K
-    nrows = (n_words + 31) // 32 + 1
-    ngroups = (nrows + K - 1) // K + 1
-    flat = rows(key, group0, ngroups, K)
-    return lax.dynamic_slice(flat, (word0 - group0 * (32 * K),), (n_words,))
+    from . import _ffi
+
+    def xla():
+        word0 = bit_position >> 5
+        row0 = word0 >> 5
+        group0 = row0 // K
+        nrows = (n_words + 31) // 32 + 1
+        ngroups = (nrows + K - 1) // K + 1
+        flat = rows(key, group0, ngroups, K)
+        return lax.dynamic_slice(flat, (word0 - group0 * (32 * K),), (n_words,))
+
+    supported = n_words > 0 and K >= _ffi.TILE_STEPS
+    return _ffi.on_cuda(supported, lambda: _ffi.fill(jnp.asarray(key, U32), bit_position, n_words, U32, K, "stream"), xla)
