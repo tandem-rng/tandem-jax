@@ -101,8 +101,13 @@ def child_keys(key, counter_lo, counter_hi, domain, aux, hidden):
 
 def rows(key, group0, ngroups, K):
     """Stream words of `ngroups` groups from `group0` at chunk length `K`, as a flat array
-    in stream order: row by row, eight 128-bit blocks per row."""
+    in stream order: row by row, eight 128-bit blocks per row. The array may extend past the
+    last group."""
+    from . import _gpu
+
     c = jnp.asarray(8 * group0, jnp.uint64 if jax.config.jax_enable_x64 else U32)
+    if _gpu.available():
+        return _gpu.rows(key, c, ngroups, K)
     c = c + jnp.arange(8 * ngroups, dtype=c.dtype)
     if c.dtype == jnp.uint64:
         counter = (c.astype(U32), (c >> jnp.uint64(32)).astype(U32))

@@ -109,18 +109,29 @@ and runs the key implementation under `jit` and `vmap`.
 
 ## Speed
 
-Apple M4, XLA CPU backend, `pixi run bench`, 2^24 Float64 draws, minimum of seven runs after
-a warm-up:
+NVIDIA A100 (one GPU of two, idle), CUDA 12 `jaxlib` 0.11.2 with driver 570, `jax_enable_x64`,
+`pixi run bench`, jitted, minimum of seven runs after a warm-up, GiB/s of output.
+`jax.random` uses the default threefry2x32 key.
 
-| | GiB/s |
-|---|---|
-| `tandem_jax.stream(key, 0, n, float64)` | 6.7 |
-| `jax.random.uniform(tandem key, float64)` | 6.6 |
-| `jax.random.uniform(threefry key, float64)` | 5.3 |
-| `jax.random.uniform(rbg key, float64)` | 9.9 |
+| draw | log2 n | tandem_jax | threefry |
+|---|---|---|---|
+| uniform float32 | 24 | 151 | 167 |
+| uniform float64 | 24 | 177 | 317 |
+| normal float32 | 24 | 108 | 151 |
+| normal float64 | 24 | 101 | 115 |
+| randint int32 in [0, 1000) | 24 | 76 | 109 |
+| randint int64 in [0, 1000) | 24 | 127 | 236 |
+| uniform float32 | 27 | 272 | 348 |
+| uniform float64 | 27 | 273 | 589 |
+| normal float32 | 27 | 164 | 245 |
+| normal float64 | 27 | 139 | 110 |
+| randint int32 in [0, 1000) | 27 | 165 | 172 |
+| randint int64 in [0, 1000) | 27 | 243 | 317 |
 
-XLA runs the elementwise step over all chunks at once and uses several threads. The rbg
-row is XLA's built-in generator op.
+On a GPU backend the stream rows come from one Pallas kernel (`src/tandem_jax/_gpu.py`) that
+keeps the chunk state in registers and writes each block once. Without it XLA writes the state of
+every step to memory, and the same draws run two to four times slower. JAX marks the Pallas
+Triton backend as deprecated, so a future JAX release may need the kernel ported.
 
 ## AI assistance
 
