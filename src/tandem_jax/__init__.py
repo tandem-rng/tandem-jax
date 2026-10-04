@@ -83,7 +83,8 @@ def _elements(words, bit_width, n):
     w = words[: (n + per - 1) // per]
     shifts = U32(bit_width) * jnp.arange(per, dtype=U32)
     parts = (w[:, None] >> shifts) & U32((1 << bit_width) - 1)
-    return parts.reshape(-1)[:n].astype(jnp.dtype(f"uint{bit_width}"))
+    # Bits are held in uint8, there is no 1-bit integer type.
+    return parts.reshape(-1)[:n].astype(jnp.dtype(f"uint{max(bit_width, 8)}"))
 
 
 def _random_bits(key, bit_width, shape):
@@ -126,6 +127,11 @@ def key_data(k):
 
 
 _WIDTH = {
+    jnp.dtype("bool"): 1,
+    jnp.dtype("int8"): 8,
+    jnp.dtype("int16"): 16,
+    jnp.dtype("int32"): 32,
+    jnp.dtype("int64"): 64,
     jnp.dtype("uint8"): 8,
     jnp.dtype("uint16"): 16,
     jnp.dtype("uint32"): 32,
@@ -147,8 +153,16 @@ def _to_float(raw, dtype):
 
 def stream(k, position, n, dtype=jnp.float64, chunk_length=K):
     """`n` draws of `dtype` from stream bit `position`, with the spec's alignment and
-    float mappings. Returns the draws and the position after them."""
+    mappings: bool is one bit, signed integers reinterpret the unsigned draw, floats use
+    the spec's scaling, and complex draws alternate real and imaginary components of the
+    matching float type. Returns the draws and the position after them."""
     dtype = jnp.dtype(dtype)
+    if jnp.issubdtype(dtype, jnp.complexfloating):
+        part = jnp.dtype("float32" if dtype == jnp.complex64 else "float64")
+        parts, pos = stream(k, position, 2 * n, part, chunk_length)
+        return lax.complex(parts[0::2], parts[1::2]), pos
+    if dtype not in _WIDTH:
+        raise TypeError(f"stream does not support dtype {dtype}")
     w = _WIDTH[dtype]
     position = jnp.asarray(position, jnp.uint64 if jax.config.jax_enable_x64 else U32)
     aligned = (position + (w - 1)) & ~jnp.asarray(w - 1, position.dtype)
@@ -161,7 +175,14 @@ def stream(k, position, n, dtype=jnp.float64, chunk_length=K):
         raw = lax.dynamic_slice(_elements(words, w, n_words * per), (offset,), (n,))
     else:
         raw = _elements(words, w, n)
-    out = _to_float(raw, dtype) if jnp.issubdtype(dtype, jnp.floating) else raw
+    if jnp.issubdtype(dtype, jnp.floating):
+        out = _to_float(raw, dtype)
+    elif dtype == jnp.bool_:
+        out = raw != 0
+    elif jnp.issubdtype(dtype, jnp.signedinteger):
+        out = lax.bitcast_convert_type(raw, dtype)
+    else:
+        out = raw
     return out, aligned + w * n
 
 

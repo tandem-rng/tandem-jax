@@ -252,3 +252,43 @@ def test_uniform_dtypes_range_and_jax_difference():
     assert not np.array_equal(np.array(jax.random.uniform(k, (16,), jnp.float64)), np.array(tj.uniform(k, (16,), jnp.float64)))
     with pytest.raises(ValueError):
         tj.uniform(k, (2,), jnp.uint32)
+
+
+def test_bool_stream_matches_dump():
+    want = dump("seed42_K32_bool.bin", np.uint8).astype(bool)
+    k = tj.key(42)
+    got, pos = tj.stream(k, 0, len(want), jnp.bool_)
+    assert got.dtype == jnp.bool_ and int(pos) == len(want)
+    assert np.array_equal(np.array(got), want)
+    for start in (1, 5, 31, 32, 33, 1000):
+        part, _ = tj.stream(k, start, 300, jnp.bool_)
+        assert np.array_equal(np.array(part), want[start : start + 300])
+    # Bool draws are single bits: no alignment, and they interleave with wider draws.
+    _, pos = tj.stream(k, 3, 2, jnp.bool_)
+    assert int(pos) == 5
+    assert int(tj.stream(k, pos, 1, jnp.uint8)[1]) == 16
+
+
+@pytest.mark.parametrize("signed, unsigned", [("int8", "uint8"), ("int16", "uint16"), ("int32", "uint32"), ("int64", "uint64")])
+def test_signed_ints_reinterpret(signed, unsigned):
+    k = tj.key(42)
+    u = np.array(tj.stream(k, 5, 200, getattr(jnp, unsigned))[0])
+    s, pos = tj.stream(k, 5, 200, getattr(jnp, signed))
+    assert s.dtype == np.dtype(signed) and np.array_equal(np.array(s), u.view(signed))
+    assert (u.view(signed) < 0).any()
+    assert int(pos) == int(tj.stream(k, 5, 200, getattr(jnp, unsigned))[1])
+
+
+@pytest.mark.parametrize("name, dtype", [("seed42_K32_c32.bin", jnp.complex64), ("seed42_K32_c64.bin", jnp.complex128)])
+def test_complex_stream_matches_dump(name, dtype):
+    want = dump(name, np.dtype(dtype))
+    k = tj.key(42)
+    got, pos = tj.stream(k, 0, len(want), dtype)
+    assert got.dtype == np.dtype(dtype) and np.array_equal(np.array(got), want)
+    w = np.dtype(dtype).itemsize * 4
+    assert int(pos) == len(want) * 2 * w
+    part, _ = tj.stream(k, 7 * 2 * w, 100, dtype)
+    assert np.array_equal(np.array(part), want[7:107])
+    # A complex draw is a real fill of twice the length, aligned to the component width.
+    _, after_byte = tj.stream(k, 8, 3, dtype)
+    assert int(after_byte) == ((8 + w - 1) & ~(w - 1)) + 6 * w
