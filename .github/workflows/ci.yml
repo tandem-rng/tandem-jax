@@ -10,20 +10,27 @@ permissions:
 
 jobs:
   test:
-    name: ${{ matrix.os }} / python ${{ matrix.python }}
+    name: ${{ matrix.os }} / python ${{ matrix.python }} / ${{ matrix.cpu-extension && 'tandem-c fills' || 'XLA' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.14"]
+        cpu-extension: [false, true]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - run: pip install . pytest
-      - run: pytest
+      # Built against the installed jaxlib: a newer FFI header version fails to register.
+      - if: matrix.cpu-extension
+        run: |
+          pip install scikit-build-core
+          pip install --no-build-isolation ./cpu
+          python -c "import tandem_jax; assert tandem_jax._ffi.tandem_jax_cpu"
+      - run: pytest -rs
   vectors:
     name: vectors are current
     runs-on: ubuntu-latest

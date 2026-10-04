@@ -219,9 +219,10 @@ def stream(k, position, n, dtype=jnp.float64, chunk_length=None):
             return lax.bitcast_convert_type(raw, dtype)
         return raw
 
-    # The kernels write 32- and 64-bit draws as the dtype; narrower ones come from the word fill.
-    supported = w >= 32 and n > 0 and chunk_length >= _ffi.TILE_STEPS
-    out = _ffi.on_cuda(supported, lambda: _ffi.fill(key, aligned, n, dtype, chunk_length, "stream"), xla)
+    # The CUDA kernels write 32- and 64-bit draws as the dtype; narrower ones come from the word
+    # fill. tandem-c fills every width but single bits.
+    cuda = w >= 32 and n > 0 and chunk_length >= _ffi.TILE_STEPS
+    out = _ffi.native(cuda, w >= 8 and n > 0, lambda: _ffi.fill(key, aligned, n, dtype, chunk_length, "stream"), xla)
     return out, aligned + w * n
 
 
@@ -323,8 +324,8 @@ def stream_normal(k, position, n, dtype=None):
 def _normal(key, position, n, dtype, chunk):
     draws = 2 * ((n + 1) // 2)
     pos = _align(position, 8 * dtype.itemsize) + 8 * dtype.itemsize * draws
-    cuda = lambda: _ffi.fill(key, position, n, dtype, chunk, "normal")
-    return _ffi.on_cuda(True, cuda, lambda: _box_muller(key, position, draws, dtype, chunk)[:n]), pos
+    call = lambda: _ffi.fill(key, position, n, dtype, chunk, "normal")
+    return _ffi.native(True, True, call, lambda: _box_muller(key, position, draws, dtype, chunk)[:n]), pos
 
 
 def _box_muller(key, position, draws, dtype, chunk):
@@ -518,7 +519,7 @@ def stream_randint(k, position, n, minval, maxval, dtype=None, width=None):
                 )
         return val.astype(dtype), pos
 
-    def cuda():
+    def native():
         # Width 0 leaves the choice to the kernel, which reads the range, so no conditional runs.
         w = width or (32 if wide.itemsize == 4 else 0)
         # The kernels store 32- or 64-bit outputs at least as wide as the draw.
@@ -530,10 +531,10 @@ def stream_randint(k, position, n, minval, maxval, dtype=None, width=None):
             return val, _align(p, w) + w * n
         return val, jnp.where(r > wide.type(2**32), _align(p, 64) + 64 * n, _align(p, 32) + 32 * n)
 
-    # Per-element bounds take the XLA path, the kernels take one range per fill. The kernels
-    # read a range of 0 as empty, so a dtype's whole range takes the XLA path too.
-    supported = jnp.ndim(lo) == 0 and jnp.ndim(r) == 0 and full is False and _chunk_length(k) >= _ffi.TILE_STEPS
-    return _ffi.on_cuda(supported, cuda, xla)
+    # Per-element bounds take the XLA path, the native fills take one range per fill. They read
+    # a range of 0 as empty, so a dtype's whole range takes the XLA path too.
+    supported = jnp.ndim(lo) == 0 and jnp.ndim(r) == 0 and full is False
+    return _ffi.native(supported and _chunk_length(k) >= _ffi.TILE_STEPS, supported, native, xla)
 
 
 def randint(k, shape, minval, maxval, dtype=None, position=0, width=None):

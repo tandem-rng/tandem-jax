@@ -632,9 +632,81 @@ def test_cuda_kernels_batch_under_vmap():
 
 
 @cuda_only
-def test_cuda_lowers_to_the_kernels_and_cpu_to_xla():
+def test_cuda_lowers_to_the_kernels():
     k = tj.key(1)
     f = lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))
     assert jax.jit(f).lower().compile().as_text().count('custom_call_target="tandem_fill"') == 4
     with jax.default_device(jax.devices("cpu")[0]):
-        assert "tandem_fill" not in jax.jit(f).lower().compile().as_text()
+        assert ("tandem_fill" in jax.jit(f).lower().compile().as_text()) == CPU
+
+
+CPU = tj._ffi.tandem_jax_cpu is not None
+cpu_only = pytest.mark.skipif(not CPU, reason="needs the tandem_jax_cpu extension")
+
+
+def _without_cpu_extension(monkeypatch, f):
+    """`f()` lowered without the CPU extension, so on the XLA path."""
+    monkeypatch.setattr(tj._ffi, "tandem_jax_cpu", None)
+    jax.clear_caches()
+    try:
+        return f()
+    finally:
+        monkeypatch.undo()
+        jax.clear_caches()
+
+
+@cpu_only
+@pytest.mark.parametrize("K", [1, 32])
+def test_cpu_fills_equal_the_xla_path(K, monkeypatch):
+    # Odd, unaligned and 2^33-bit starts, and fills large enough to split over the thread pool,
+    # with rejected bounded draws far into the stream.
+    cpu = jax.devices("cpu")[0]
+    kd = tj.key_data(tj.key(77))
+    typed = lambda kd: jax.random.wrap_key_data(kd, impl=tj.impl_for(K))
+    dtypes = ("uint8", "int8", "uint16", "float16", "uint32", "int32", "float32", "uint64", "int64", "float64")
+    draws = [(lambda d: lambda kd, p, n: tj.stream(typed(kd), p, n, d)[0])(d) for d in dtypes]
+    normals = [(lambda d: lambda kd, p, n: tj.stream_normal(typed(kd), p, n, d)[0])(d) for d in ("float32", "float64")]
+    bounded = [
+        (lambda a, b, d, w: lambda kd, p, n: tj.stream_randint(typed(kd), p, n, a, b, d, w)[0])(*c)
+        for c in ((0, 1000, "int32", None), (-7, 2**31 + 1, "int64", None), (0, 2**32, "int64", None), (3, 2**40, "int64", None),
+                  (0, 2**63 + 1, "uint64", None), (5, 5, "int32", None), (-9, 1000, "int32", 64), (3, 250, "uint8", None))
+    ]
+    cases = [(f, n, p) for f in draws + normals + bounded for n in (7, 300001) for p in (1, 2**33 + 7)]
+    run = lambda: [_run_on(cpu, lambda kd, p: f(kd, p, n), kd, jnp.uint64(p)) for f, n, p in cases]
+    got, want = run(), _without_cpu_extension(monkeypatch, run)
+    for (f, n, p), g, w in zip(cases, got, want):
+        if f in normals:
+            close(g, w, w.dtype.type)
+        else:
+            assert np.array_equal(g, w), (cases.index((f, n, p)), n, p)
+
+
+@cpu_only
+def test_cpu_normals_equal_the_c_fixtures_bit_for_bit():
+    k = tj.key(42)
+    for dtype, name in ((jnp.float64, "pairs64"), (jnp.float32, "pairs32")):
+        z, _ = tj.stream_normal(k, 1, len(D[name]), dtype)
+        assert np.array_equal(np.array(z), np.array(D[name], dtype)), name
+
+
+@cpu_only
+def test_cpu_fills_batch_under_vmap():
+    keys = jax.random.split(tj.key(5), 3)
+    pos = jnp.array([0, 33, 2**33 + 1], jnp.uint64)
+    for f in (
+        lambda k, p: tj.stream(k, p, 300001, jnp.float32)[0],
+        lambda k, p: tj.stream(k, p, 1001, jnp.uint8)[0],
+        lambda k, p: tj.stream_normal(k, p, 1001, jnp.float64)[0],
+        lambda k, p: tj.stream_randint(k, p, 1001, -3, 2**31 + 1, jnp.int64)[0],
+    ):
+        batched = np.array(jax.jit(jax.vmap(f))(keys, pos))
+        for i in range(3):
+            assert np.array_equal(batched[i], np.array(f(keys[i], pos[i])))
+
+
+@cpu_only
+def test_cpu_lowers_to_the_fills(monkeypatch):
+    k = tj.key(1)
+    f = lambda: jax.jit(lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))).lower().compile().as_text()
+    assert f().count('custom_call_target="tandem_fill"') == 4
+    assert "tandem_fill" not in _without_cpu_extension(monkeypatch, f)

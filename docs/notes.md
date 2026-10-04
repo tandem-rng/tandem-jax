@@ -97,6 +97,30 @@ pip install .
 For development, `pixi install` creates an environment with the package installed editable,
 and `pixi run test` runs the tests.
 
+### CPU fills
+
+The package in `cpu/` builds the tandem-c fills as an XLA FFI handler for the CPU, under the same
+target name and operands as the CUDA one. Build it against the installed `jaxlib`, since a handler
+built on newer FFI headers fails to register and stops the CPU backend from starting:
+
+```sh
+pip install scikit-build-core
+pip install --no-build-isolation ./cpu
+```
+
+`tandem_jax` loads the extension on import when it is installed. On the CPU, `stream` for every
+dtype but `bool`, `uniform`, `normal`, `randint` with scalar bounds, their `stream_*` forms and
+`jax.random.bits` then run on the tandem-c fills, at any chunk length. Fills of 256 KiB or more
+split into parts at stream row boundaries, one per thread of XLA's intra-op pool, and the call
+completes when the last part does. `jit` and `vmap` work: a batch writes its rows back to back.
+Stream draws, uniforms and bounded integers equal the XLA path bit for bit. Normals equal tandem-c
+bit for bit and the XLA path within the tolerance of Appendix A, since XLA's `log`, `sin` and `cos`
+are not tandem-c's polynomials.
+
+`cpu/tandem` holds `tandem.c` and `tandem.h` of tandem-c commit `86ea14e`, the last with
+Box-Muller `float64` normals. Its source is compiled with `-ffp-contract=off`, as tandem-c's
+Makefile does, which keeps the normals bit exact on every compiler.
+
 ### CUDA kernels
 
 The package in `cuda/` builds the tandem-cuda fills as an XLA FFI handler. It needs the CUDA
@@ -132,8 +156,12 @@ fork children at traced positions, split children for indices up to 2^64 - 1 aga
 and runs the key implementation under `jit` and `vmap`. On a CUDA device with the extension, the
 whole suite runs on the kernels, and three more tests check that the kernels equal the XLA path
 on the CPU device for every fill at odd, unaligned and 2^33-bit starts and over many thread
-blocks, that a `vmap` batch equals its rows, and that a GPU lowering calls the kernels while a
-CPU lowering does not.
+blocks, that a `vmap` batch equals its rows, and that a GPU lowering calls the kernels. With the
+CPU extension, the whole suite runs on the tandem-c fills, and four more tests check that the
+fills equal the XLA path for every fill at odd and 2^33-bit starts, at chunk lengths 1 and 32 and
+at sizes that split over the thread pool, that the normals equal tandem-c's pairs bit for bit,
+that a `vmap` batch equals its rows, and that a CPU lowering calls the fills and does not without
+the extension. CI runs the suite on Linux and macOS with and without it.
 
 ## Speed
 

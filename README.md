@@ -4,7 +4,8 @@
 
 JAX key implementation of [Tandem8x32](https://github.com/tandem-rng/spec), a noncryptographic
 pseudorandom number generator. It is pure Python over `jax.numpy` and `jax.lax`, with optional
-CUDA kernels from [tandem-cuda](https://github.com/tandem-rng/tandem-cuda). It produces the
+fills from [tandem-c](https://github.com/tandem-rng/tandem-c) on the CPU and
+kernels from [tandem-cuda](https://github.com/tandem-rng/tandem-cuda) on NVIDIA GPUs. It produces the
 stream the specification defines, bit for bit, fast on CPU and GPU.
 
 ## Install
@@ -15,6 +16,16 @@ pip install .
 
 Needs Python 3.11 and `jax>=0.10`. For development, `pixi install`, then `pixi run test`.
 64-bit types need `jax.config.update("jax_enable_x64", True)`.
+
+For the CPU, build the XLA FFI extension in `cpu/` against the installed `jaxlib`. It needs a C
+and C++17 compiler and CMake 3.18 or later.
+
+```sh
+pip install scikit-build-core
+pip install --no-build-isolation ./cpu
+```
+
+`cpu/tandem` is tandem-c commit `86ea14e`.
 
 For NVIDIA GPUs, build the XLA FFI extension in `cuda/`. It needs `nvcc` matching your
 `jax[cuda]` major version, and CMake 3.24 or later.
@@ -60,8 +71,9 @@ kids, pos = tj.fork(key, pos, 4)                   # the spec's fork, typed keys
 - `tj.randint`, `tj.stream_randint`: bounded integers, same values in every port.
 - `tj.normal`, `tj.stream_normal`: Box-Muller normals, same to the tolerance of Appendix A.
 - Neither `tj.normal` nor `tj.randint` equals the `jax.random` function of that name.
-- CUDA: `stream`, `uniform`, `normal`, `randint`, and `jax.random` on a Tandem key run on the
-  kernels on a GPU, under `jit` and `vmap`. A CPU device keeps the XLA path.
+- CPU: with `cpu/` installed, `stream`, `uniform`, `normal`, `randint`, and `jax.random` on a
+  Tandem key run on the tandem-c fills over XLA's thread pool, under `jit` and `vmap`.
+- CUDA: the same functions run on the kernels on a GPU, under `jit` and `vmap`.
 - Parallel use: ranks, threads, or devices that start at the position of their first element, or
   draw from `split(task)`, reproduce a serial run. See
   [Appendix B](https://github.com/tandem-rng/spec/blob/main/SPEC.md#appendix-b-parallel-decomposition-non-normative).
@@ -78,6 +90,7 @@ kids, pos = tj.fork(key, pos, 4)                   # the spec's fork, typed keys
 - Fills cut at any element equal the whole fill, under `jit` and `vmap`.
 - Normal moments to fourth order and a KS test on 10^7 draws, and chi-square uniformity of
   bounded integers at a range that rejects a quarter of the draws.
+- With the CPU extension, the fills equal the XLA path, and normals equal tandem-c bit for bit.
 - With the CUDA extension, the kernels equal the XLA path on the CPU device.
 
 ## Speed

@@ -134,5 +134,5 @@ def words_from(key, bit_position, n_words, K=32):
         flat = rows(key, group0, ngroups, K)
         return lax.dynamic_slice(flat, (word0 - group0 * (32 * K),), (n_words,))
 
-    supported = n_words > 0 and K >= _ffi.TILE_STEPS
-    return _ffi.on_cuda(supported, lambda: _ffi.fill(jnp.asarray(key, U32), bit_position, n_words, U32, K, "stream"), xla)
+    call = lambda: _ffi.fill(jnp.asarray(key, U32), bit_position, n_words, U32, K, "stream")
+    return _ffi.native(n_words > 0 and K >= _ffi.TILE_STEPS, n_words > 0, call, xla)

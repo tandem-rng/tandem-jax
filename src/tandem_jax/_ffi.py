@@ -1,5 +1,6 @@
-"""Fills by the tandem-cuda kernels as XLA FFI calls, on CUDA devices when the `tandem_jax_cuda`
-extension is installed. Everywhere else the XLA path runs."""
+"""Fills by native code as XLA FFI calls: the tandem-cuda kernels on CUDA devices when the
+`tandem_jax_cuda` extension is installed, the tandem-c fills on the CPU when `tandem_jax_cpu` is.
+Everywhere else the XLA path runs."""
 
 import jax
 import jax.numpy as jnp
@@ -8,7 +9,7 @@ from jax import lax
 
 U32 = jnp.uint32
 TILE_STEPS = 8
-"""The fill kernels step a chunk this many blocks at a time, so they need K >= 8."""
+"""The CUDA fill kernels step a chunk this many blocks at a time, so they need K >= 8."""
 
 try:
     import tandem_jax_cuda
@@ -16,6 +17,13 @@ except ImportError:
     tandem_jax_cuda = None
 else:
     jax.ffi.register_ffi_target("tandem_fill", tandem_jax_cuda.fill_handler(), platform="CUDA")
+
+try:
+    import tandem_jax_cpu
+except ImportError:
+    tandem_jax_cpu = None
+else:
+    jax.ffi.register_ffi_target("tandem_fill", tandem_jax_cpu.fill_handler(), platform="cpu")
 
 
 def _words(x):
@@ -27,7 +35,7 @@ def _words(x):
 
 
 def fill(key, position, n, dtype, chunk, kind, bound=0, low=0, width=0):
-    """`n` elements of `dtype` at stream bit `position` from the kernel `kind`: "stream" for the
+    """`n` elements of `dtype` at stream bit `position` from the fill `kind`: "stream" for the
     spec's draws, "below" for bounded integers `low + [0, bound)` of draw width `width` (0 takes it
     from the bound), "normal" for Box-Muller normals."""
     prm = jnp.concatenate([jnp.asarray(key, U32), jnp.stack(_words(position) + _words(bound) + _words(low))])
@@ -35,9 +43,15 @@ def fill(key, position, n, dtype, chunk, kind, bound=0, low=0, width=0):
     return call(prm, n=np.int64(n), chunk=np.int64(chunk), kind=kind, width=np.int32(width))
 
 
-def on_cuda(supported, cuda, default):
-    """`cuda()` when lowered for a CUDA device with the extension loaded and `supported`, else
-    `default()`. The choice is made at lowering, so the compiled code holds one branch only."""
-    if tandem_jax_cuda is None or not supported:
+def native(cuda, cpu, call, default):
+    """`call()` when lowered for a CUDA device with its extension loaded and `cuda` true, or for
+    the CPU with its extension loaded and `cpu` true, else `default()`. The choice is made at
+    lowering, so the compiled code holds one branch only."""
+    branches = {}
+    if cuda and tandem_jax_cuda is not None:
+        branches["cuda"] = call
+    if cpu and tandem_jax_cpu is not None:
+        branches["cpu"] = call
+    if not branches:
         return default()
-    return lax.platform_dependent(cuda=cuda, default=default)
+    return lax.platform_dependent(**branches, default=default)

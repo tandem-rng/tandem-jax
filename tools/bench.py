@@ -42,6 +42,7 @@ def best(fn, nbytes):
 
 tk, jk = tj.key(42), jax.random.key(0)
 print("backend", jax.default_backend(), jax.devices()[0])
+print("extensions", [m.__name__ for m in (tj._ffi.tandem_jax_cpu, tj._ffi.tandem_jax_cuda) if m])
 print(f"{'draw':26s} {'log2 n':>6s} {'tandem':>8s} {'threefry':>9s}  GiB/s of output")
 for lg in sizes:
     n = 2**lg
