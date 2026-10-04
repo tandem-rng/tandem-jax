@@ -318,3 +318,23 @@ def test_chunk_length_variants():
     for bad in (0, 3, 131072, -8):
         with pytest.raises(ValueError, match="power of two"):
             tj.impl_for(bad)
+
+
+def test_cross_port_fixture_from_c_reference():
+    # tests/cross_port.json is written by tools/gen_split_fixture.c from the C reference.
+    X = json.loads((HERE / "cross_port.json").read_text())
+    k = tj.key(X["seed"])
+    assert np.array_equal(np.array(jax.random.key_data(k)), words(X["key"]))
+    for i, want in X["split"].items():
+        got = jax.random.key_data(tj.split(k, jnp.uint64(int(i))))
+        assert np.array_equal(np.array(got), words(want)), i
+    for p, want in X["fork"].items():
+        kids, new = jax.jit(lambda k, p: tj.fork(k, p, 3))(k, jnp.uint64(int(p)))
+        assert int(new) == want["new_position"], p
+        for g, w in zip(np.array(jax.random.key_data(kids)), want["children"]):
+            assert np.array_equal(g, words(w)), p
+    for u, want in X["sub"].items():
+        got = jax.random.key_data(tj.sub(k, jnp.uint64(int(u))))
+        if int(u) < 2**32:
+            assert np.array_equal(np.array(jax.random.key_data(jax.random.fold_in(k, int(u)))), words(want))
+        assert np.array_equal(np.array(got), words(want)), u

@@ -32,6 +32,9 @@ or array, traced or not, and returns typed keys. `jax.random.split(key, n)` give
 `0..n-1`. A count above 2^32 needs `jax_enable_x64`, and without it `split` raises
 `ValueError` instead of repeating keys.
 
+`tj.sub(key, purpose)` is the purpose child for a purpose of up to 64 bits. `jax.random.fold_in`
+passes the implementation a 32-bit value, so it covers purposes below 2^32 only.
+
 `tj.fork(key, position, n)` returns `n` typed keys and the parent's new position. The position
 may be a traced `uint64`, so it runs under `jit`. `tj.fork_words` returns the same children
 as an `(n, 4)` array of `uint32` key words.
@@ -74,7 +77,7 @@ and `pixi run test` runs the tests.
 ## Tests
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
-of the spec repository's file, with a drift check in CI), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
+of the spec repository's file, with a drift check in CI), checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
 `jax.random.bits` with reference stream dumps in `tests/data`,
 fork children at traced positions, split children for indices up to 2^64 - 1 against a direct evaluation of F,
 and runs the key implementation under `jit` and `vmap`.

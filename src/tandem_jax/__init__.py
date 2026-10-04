@@ -21,7 +21,7 @@ from jax.extend.random import define_prng_impl
 from . import _core
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
-__all__ = ["impl", "impl_for", "key", "key_data", "split", "stream", "uniform", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
+__all__ = ["impl", "impl_for", "key", "key_data", "split", "sub", "stream", "uniform", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
 
 K = 32
 """The chunk length of the default key implementation: the canonical Tandem8x32-K32."""
@@ -138,6 +138,15 @@ def _is_typed(k):
 
 def _chunk_length(k):
     return _CHUNK_LENGTH.get(str(jax.random.key_impl(k)), K) if _is_typed(k) else K
+
+
+def sub(k, purpose):
+    """The spec's purpose child of a key for an unsigned `purpose` of up to 64 bits, scalar
+    or array. `jax.random.fold_in` hands the implementation a 32-bit value, so it covers
+    purposes below 2^32 only."""
+    lo, hi = _words(purpose)
+    o, _ = F_keyed(tuple(key_data(k)), (lo, hi), DOMAIN_FOLD, 0)
+    return jax.random.wrap_key_data(jnp.stack(o, -1), impl=impl_for(_chunk_length(k)))
 
 
 def key_data(k):
