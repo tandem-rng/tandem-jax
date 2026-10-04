@@ -167,6 +167,10 @@ the extension. CI runs the suite on Linux and macOS with and without it.
 
 Apple M4 Pro, XLA CPU backend, `jax_enable_x64`, `pixi run bench 22`, jitted, minimum of five
 runs after a warm-up, GiB/s of output, 2^22 elements. `jax.random` uses the default threefry2x32 key.
+With `cpu/` built to fill in one part, the uniforms ran at 16.0 (`float32`) and 16.6 (`float64`)
+GiB/s against 16.6 and 16.1 for tandem-c's own fills in the same window, the normals at 5.3 and 4.8
+against 5.4 and 4.8. The thread pool gives the rest of the `cpu/` column, and moves with the load
+on the other cores: normals ranged from 21 to 35 GiB/s over two runs.
 
 NVIDIA A100 (one GPU of two, idle), CUDA 12 `jaxlib` 0.11.2 with driver 570, `jax_enable_x64`,
 the CUDA kernels built for `sm_80`, `python tools/bench.py`. Each function is jitted and warmed up for half
