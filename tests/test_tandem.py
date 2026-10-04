@@ -72,7 +72,7 @@ def test_derived_keys():
     assert np.array_equal(np.array(kids[0]), words(k["split_child_0"]))
     assert np.array_equal(np.array(kids[1]), words(k["split_child_1"]))
     assert np.array_equal(np.array(jax.random.key_data(jax.random.fold_in(typed(KEY), 7))), words(k["purpose_7"]))
-    forks, pos = tj.fork(KEY, 0, 3)
+    forks, pos = tj.fork_words(KEY, 0, 3)
     assert np.array_equal(np.array(forks[0]), words(k["fork_child_0_at_block_0"]))
     assert pos == 128
 
@@ -199,3 +199,29 @@ def test_split_count_above_2_32():
     with jax.enable_x64(False):
         with pytest.raises(ValueError, match="x64"):
             jax.jit(lambda k: jax.random.split(k, 2**32 + 3)).lower(tj.key(1))
+
+
+def _fork_oracle(key_words, position, i):
+    b = position >> 7
+    o, h = tj.F_keyed(
+        tuple(key_words), (jnp.uint32(b & 0xFFFFFFFF), jnp.uint32(b >> 32)), tj._core.DOMAIN_FORK, (i >> 1) & 0xFFFFFFFF
+    )
+    return np.array(h if i & 1 else o)
+
+
+def test_fork_typed_jit_and_traced_position():
+    k = typed(KEY)
+    kids, pos = tj.fork(k, 0, 3)
+    assert jnp.issubdtype(kids.dtype, jax.dtypes.prng_key) and kids.shape == (3,)
+    assert np.array_equal(np.array(jax.random.key_data(kids[0])), words(V["derived_keys"]["fork_child_0_at_block_0"]))
+    assert int(pos) == 128
+    f = jax.jit(lambda k, p: tj.fork(k, p, 5))
+    for p in (0, 127, 128, 5000, 2**40 + 129, 2**62):
+        kids, new = f(k, jnp.uint64(p))
+        assert int(new) == ((p >> 7) + 1) << 7
+        for i, c in enumerate(np.array(jax.random.key_data(kids))):
+            assert np.array_equal(c, _fork_oracle(KEY, p, i)), (p, i)
+    # Typed children feed jax.random directly, and a raw key is accepted too.
+    jax.random.bits(kids[0], (2,), jnp.uint32)
+    assert np.array_equal(np.array(tj.fork_words(KEY, 5000, 5)[0]), np.array(jax.random.key_data(f(k, 5000)[0])))
+    assert tj.fork(k, 0, 0)[0].shape == (0,) and int(tj.fork(k, 0, 0)[1]) == 128

@@ -19,7 +19,7 @@ from jax.extend.random import define_prng_impl
 from . import _core
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
-__all__ = ["impl", "key", "key_data", "split", "stream", "T", "F", "F_keyed", "whiten", "block", "fork"]
+__all__ = ["impl", "key", "key_data", "split", "stream", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
 
 K = 32
 """The chunk length of the key implementation: the canonical Tandem8x32-K32."""
@@ -174,10 +174,23 @@ def block(k, c, j):
     return jnp.stack(o)
 
 
+def fork_words(k, position, n):
+    """The `n` fork children of a key at a bit position as (n, 4) uint32 words, and the
+    parent's new position. `position` may be traced, `n` is static."""
+    if n > 2**32 and not jax.config.jax_enable_x64:
+        raise ValueError(f"forking {n} keys needs jax_enable_x64, the index exceeds 32 bits")
+    position = jnp.asarray(position, jnp.uint64 if jax.config.jax_enable_x64 else U32)
+    b = position >> position.dtype.type(7)
+    lo, hi = _words(b)
+    i = jnp.arange(n, dtype=jnp.uint64 if n > 2**32 else U32)
+    hidden, half = (i & i.dtype.type(1)).astype(U32), (i >> i.dtype.type(1)).astype(U32)
+    ones = jnp.ones(n, U32)
+    kids = _core.child_keys(tuple(key_data(k)), lo * ones, hi * ones, DOMAIN_FORK, half, hidden)
+    return kids, (b + position.dtype.type(1)) << position.dtype.type(7)
+
+
 def fork(k, position, n):
-    """The `n` fork children of a key at a bit position, (n, 4), and the parent's new position."""
-    b = int(position) >> 7
-    i = jnp.arange(n, dtype=U32)
-    counter_lo, counter_hi = jnp.full_like(i, b & 0xFFFFFFFF), jnp.full_like(i, b >> 32)
-    kids = _core.child_keys(tuple(key_data(k)), counter_lo, counter_hi, DOMAIN_FORK, i >> U32(1), i & U32(1))
-    return kids, (b + 1) << 7
+    """The `n` fork children of a key at a bit position as a typed key array of shape
+    (n,), and the parent's new position. Works under `jit` with a traced position."""
+    kids, new_position = fork_words(k, position, n)
+    return jax.random.wrap_key_data(kids, impl=impl), new_position
