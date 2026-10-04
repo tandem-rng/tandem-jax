@@ -109,6 +109,18 @@ and runs the key implementation under `jit` and `vmap`.
 
 ## Speed
 
+Apple M4 Pro, XLA CPU backend, `jax_enable_x64`, `pixi run bench 22`, jitted, minimum of five
+runs after a warm-up, GiB/s of output, 2^22 elements. `jax.random` uses the default threefry2x32 key.
+
+| draw | tandem_jax | threefry |
+|---|---|---|
+| uniform float32 | 5.2 | 3.0 |
+| uniform float64 | 4.8 | 5.5 |
+| normal float32 | 3.6 | 2.6 |
+| normal float64 | 3.3 | 3.0 |
+| randint int32 in [0, 1000) | 3.0 | 1.7 |
+| randint int64 in [0, 1000) | 5.3 | 3.0 |
+
 NVIDIA A100 (one GPU of two, idle), CUDA 12 `jaxlib` 0.11.2 with driver 570, `jax_enable_x64`,
 `pixi run bench`, jitted, minimum of seven runs after a warm-up, GiB/s of output.
 `jax.random` uses the default threefry2x32 key.

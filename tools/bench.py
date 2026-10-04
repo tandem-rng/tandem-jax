@@ -19,7 +19,7 @@ import tandem_jax as tj  # noqa: E402
 sizes = [int(a) for a in sys.argv[1:]] or [24, 27]
 
 
-def best(fn, nbytes, runs=7):
+def best(fn, nbytes, runs=5):
     fn().block_until_ready()
     ts = []
     for _ in range(runs):
