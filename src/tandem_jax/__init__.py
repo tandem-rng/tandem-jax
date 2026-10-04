@@ -272,7 +272,11 @@ def fork(k, position, n):
 
 PURPOSE_BELOW32 = 0x424C573332
 PURPOSE_BELOW64 = 0x424C573634
-_RETRY_BLOCK = 256
+# A rejection has probability below range / 2^w, so few draws are rejected. Locating them
+# with one nonzero over all elements costs several passes over the output. Counting per block
+# of _BLOCK elements and gathering the few blocks that reject is one reduction instead.
+_RETRY_MAX = 64
+_BLOCK = 1024
 
 _TWO_PI = {  # 2 pi as a high and low part, so the reduced angle is good to the last bit
     jnp.dtype("float64"): (6.283185307179586, 2.4492935982947064e-16),
@@ -406,11 +410,19 @@ def stream_randint(k, position, n, minval, maxval, dtype=None):
     if n > 2**32 and not jax.config.jax_enable_x64:
         raise ValueError(f"{n} elements need jax_enable_x64, the index exceeds 32 bits")
     pick = (lambda a, i: a[i]) if r.ndim else (lambda a, i: a)
-    count = rej.sum(dtype=jnp.int32)
+    blocks = -(-n // _BLOCK)
+    per_block = jnp.pad(rej, (0, blocks * _BLOCK - n)).reshape(blocks, _BLOCK)
+    in_block = per_block.sum(1, dtype=jnp.int32)
+    count = in_block.sum()
+    cap = min(_RETRY_MAX, n)
 
     def few(_):
-        idx = jnp.nonzero(rej, size=min(_RETRY_BLOCK, n), fill_value=0)[0].astype(index)
-        active = jnp.arange(idx.shape[0]) < count
+        # At most cap elements reject, so at most cap blocks do.
+        rows = jnp.nonzero(in_block, size=cap, fill_value=0)[0]
+        hit = per_block[rows] & (jnp.arange(cap) < (in_block > 0).sum())[:, None]
+        flat = jnp.nonzero(hit.reshape(-1), size=cap, fill_value=0)[0]
+        idx = (rows[flat // _BLOCK] * _BLOCK + flat % _BLOCK).astype(index)
+        active = jnp.arange(cap) < count
         fixed = _retry(key, idx, active, pick(r, idx), pick(t, idx), w, chunk)
         return plain.at[jnp.where(active, idx, n)].set(fixed, mode="drop")
 
@@ -418,8 +430,8 @@ def stream_randint(k, position, n, minval, maxval, dtype=None):
         fixed = _retry(key, jnp.arange(n, dtype=index), rej, r, t, w, chunk)
         return jnp.where(rej, fixed, plain)
 
-    branches = [lambda _: plain, few] + ([many] if n > _RETRY_BLOCK else [])
-    val = lax.switch((count > 0).astype(jnp.int32) + (count > _RETRY_BLOCK).astype(jnp.int32), branches, None)
+    branches = [lambda _: plain, few] + ([many] if n > _RETRY_MAX else [])
+    val = lax.switch((count > 0).astype(jnp.int32) + (count > _RETRY_MAX).astype(jnp.int32), branches, None)
     return (lo_u + val).astype(dtype), pos
 
 

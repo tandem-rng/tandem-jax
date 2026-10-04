@@ -424,3 +424,15 @@ def test_randint_bounds_dtypes_and_heavy_rejection():
     assert np.array_equal(np.array(tj.stream_randint(k, 0, 64, 0, r, jnp.uint32)[0]), full[:64])
     j = jax.jit(lambda k, p: tj.stream_randint(k, p, 100, -50, 50, jnp.int64)[0])
     assert np.array_equal(np.array(j(k, jnp.uint64(64))), np.array(tj.stream_randint(k, 64, 100, -50, 50, jnp.int64)[0]))
+
+
+def test_randint_rejections_across_blocks(monkeypatch):
+    # About 20 rejections spread over 100 blocks: the compact path must place each one by its
+    # element index. Forcing the full path gives the reference.
+    k, n, r = tj.key(7), 100_000, 1_000_000
+    plain = (np.array(tj.stream(k, 0, n, jnp.uint32)[0]).astype(np.uint64) * r) >> 32
+    got = np.array(tj.stream_randint(k, 0, n, 0, r, jnp.uint32)[0])
+    changed = np.flatnonzero(plain != got)
+    assert 5 < len(changed) <= 64 and changed.max() - changed.min() > 10_000
+    monkeypatch.setattr(tj, "_RETRY_MAX", 1)
+    assert np.array_equal(np.array(tj.stream_randint(k, 0, n, 0, r, jnp.uint32)[0]), got)
