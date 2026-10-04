@@ -1,10 +1,14 @@
-"""Throughput of uniform, normal and bounded-integer draws, jitted, best of seven after a
-warm-up: tandem_jax against jax.random with the default threefry2x32 key.
+"""Throughput of uniform, normal and bounded-integer draws, jitted: tandem_jax against jax.random
+with the default threefry2x32 key, in GiB/s of output.
+
+On a CPU a run is one call after one warm-up call, best of five. On a GPU each function first
+warms up for half a second, so the clocks settle, and a run times ten calls issued back to back,
+as a loop of draws would, best of seven: one call there is short enough that its dispatch would
+dominate the time.
 
     python tools/bench.py [log2 sizes, default 24 27]
 """
 
-import os
 import sys
 import time
 
@@ -17,20 +21,27 @@ import jax.numpy as jnp  # noqa: E402
 import tandem_jax as tj  # noqa: E402
 
 sizes = [int(a) for a in sys.argv[1:]] or [24, 27]
+GPU = jax.default_backend() == "gpu"
+RUNS, CALLS, WARM = (7, 10, 0.5) if GPU else (5, 1, 0.0)
 
 
-def best(fn, nbytes, runs=5):
-    fn().block_until_ready()
+def best(fn, nbytes):
+    jax.block_until_ready(fn())
+    end = time.perf_counter() + WARM
+    while time.perf_counter() < end:
+        jax.block_until_ready(fn())
     ts = []
-    for _ in range(runs):
+    for _ in range(RUNS):
         t0 = time.perf_counter()
-        fn().block_until_ready()
-        ts.append(time.perf_counter() - t0)
+        for _ in range(CALLS - 1):
+            fn()
+        jax.block_until_ready(fn())
+        ts.append((time.perf_counter() - t0) / CALLS)
     return nbytes / min(ts) / 2**30
 
 
 tk, jk = tj.key(42), jax.random.key(0)
-print("backend", jax.default_backend(), jax.devices()[0], "load", os.getloadavg())
+print("backend", jax.default_backend(), jax.devices()[0])
 print(f"{'draw':26s} {'log2 n':>6s} {'tandem':>8s} {'threefry':>9s}  GiB/s of output")
 for lg in sizes:
     n = 2**lg

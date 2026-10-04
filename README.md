@@ -153,23 +153,30 @@ runs after a warm-up, GiB/s of output, 2^22 elements. `jax.random` uses the defa
 | randint int64 in [0, 1000) | 5.3 | 3.0 |
 
 NVIDIA A100 (one GPU of two, idle), CUDA 12 `jaxlib` 0.11.2 with driver 570, `jax_enable_x64`,
-`pixi run bench`, jitted, minimum of seven runs after a warm-up, GiB/s of output.
-`jax.random` uses the default threefry2x32 key.
+the CUDA kernels built for `sm_80`, `python tools/bench.py`. Each function is jitted and warmed up for half
+a second, a run times ten calls issued back to back, and the table gives the best of seven runs
+in GiB/s of output. `jax.random` uses the default threefry2x32 key.
 
 | draw | log2 n | tandem_jax | threefry |
 |---|---|---|---|
-| uniform float32 | 24 | 151 | 167 |
-| uniform float64 | 24 | 177 | 317 |
-| normal float32 | 24 | 108 | 151 |
-| normal float64 | 24 | 101 | 115 |
-| randint int32 in [0, 1000) | 24 | 76 | 109 |
-| randint int64 in [0, 1000) | 24 | 127 | 236 |
-| uniform float32 | 27 | 272 | 348 |
-| uniform float64 | 27 | 273 | 589 |
-| normal float32 | 27 | 164 | 245 |
-| normal float64 | 27 | 139 | 110 |
-| randint int32 in [0, 1000) | 27 | 165 | 172 |
-| randint int64 in [0, 1000) | 27 | 243 | 317 |
+| uniform float32 | 24 | 730 | 523 |
+| uniform float64 | 24 | 1125 | 973 |
+| normal float32 | 24 | 841 | 418 |
+| normal float64 | 24 | 706 | 222 |
+| randint int32 in [0, 1000) | 24 | 919 | 298 |
+| randint int64 in [0, 1000) | 24 | 1041 | 537 |
+| uniform float32 | 27 | 1304 | 656 |
+| uniform float64 | 27 | 1345 | 991 |
+| normal float32 | 27 | 1193 | 427 |
+| normal float64 | 27 | 740 | 226 |
+| randint int32 in [0, 1000) | 27 | 1216 | 329 |
+| randint int64 in [0, 1000) | 27 | 1277 | 567 |
+
+The kernels alone, as the JAX profiler times them at 2^27, write 1280 to 1390 GiB/s, and 850 GiB/s
+for `float64` normals, the rates of tandem-cuda's own benchmark. At 2^24 the launch and dispatch
+cost of each call is a larger share, and uniform `float32` there ranged from 730 to 949 GiB/s over
+three runs. The other cells moved by a few percent. Without the extension a GPU runs the XLA path, at 77 to
+158 GiB/s for these draws at 2^27.
 
 ## AI assistance
 
