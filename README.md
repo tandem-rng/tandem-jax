@@ -65,6 +65,12 @@ for raw key words.
 64-bit types need `jax.config.update("jax_enable_x64", True)`. Without it the 32-bit
 multiplies are built from 16-bit halves, which also serves backends without 64-bit integers.
 
+Parallel use: element `i` of a fill is draw `i`, so ranks, threads or devices that start at the
+position of their first element, or draw from `split(task)`, reproduce a serial run for any
+decomposition, as
+[Appendix B](https://github.com/tandem-rng/spec/blob/main/SPEC.md#appendix-b-parallel-decomposition-non-normative)
+of the specification shows.
+
 ## Install
 
 ```sh
