@@ -22,6 +22,8 @@ bits = jax.random.bits(key, (16,), jnp.uint32)     # the stream words from posit
 key8 = tj.key(42, chunk_length=8)                  # the Tandem8x32-K8 variant
 kid = tj.split(key, 2**40 + 5)                     # the spec's split child for any unsigned 64-bit index
 u = tj.uniform(key, (1000,), jnp.float32)          # like jax.random.uniform, with the spec's mapping
+z = tj.normal(key, (1000,), jnp.float32)           # Box-Muller normals, Appendix A
+r = tj.randint(key, (1000,), 0, 6, jnp.int32)      # Lemire bounded integers, Appendix A
 x, pos = tj.stream(key, 0, 2**20, jnp.float64)     # the spec's Float64 draws, and the position after
 y, pos = tj.stream(key, pos, 100, jnp.uint8)       # continue at that position, aligned per the spec
 kids, pos = tj.fork(key, pos, 4)                   # the spec's fork at the current block, typed keys, jit-safe
@@ -31,6 +33,20 @@ kids, pos = tj.fork(key, pos, 4)                   # the spec's fork at the curr
 or array, traced or not, and returns typed keys. `jax.random.split(key, n)` gives children
 `0..n-1`. A count above 2^32 needs `jax_enable_x64`, and without it `split` raises
 `ValueError` instead of repeating keys.
+
+`tj.normal(key, shape, dtype, position=0)` and `tj.randint(key, shape, minval, maxval, dtype,
+position=0)` follow Appendix A of the specification, so every port returns the same values.
+`stream_normal(key, position, n, dtype)` and `stream_randint(key, position, n, minval, maxval,
+dtype)` return the draws and the position after them, which is aligned to the draw width plus
+`2 * ceil(n / 2)` draws for normals and `n` draws for bounded integers, and unchanged for
+`n = 0`. Normals are Box-Muller pairs: elements `2j` and `2j + 1` are `r cos 2 pi b` and
+`r sin 2 pi b` from uniform draws `2j` and `2j + 1`, computed in `float32` or `float64` as the
+dtype says. Bounded integers use Lemire's method on draw `i` for element `i`, 32 bits for
+dtypes up to 32 bits and 64 bits otherwise. A rejected draw retries on the fallback stream
+`split(i)` of `sub(0x424c573332)` (`0x424c573634` for 64 bits) from position 0, in a loop that
+runs only when a draw was rejected. `maxval <= minval` gives `minval`. Bounded integers and
+uniforms are exact across ports. Normals agree to the tolerance of Appendix A. Neither equals
+`jax.random.normal` or `jax.random.randint`.
 
 `tj.sub(key, purpose)` is the purpose child for a purpose of up to 64 bits. `jax.random.fold_in`
 passes the implementation a 32-bit value, so it covers purposes below 2^32 only.
@@ -83,7 +99,7 @@ and `pixi run test` runs the tests.
 ## Tests
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
-of the spec repository's file, with a drift check in CI), checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
+of the spec repository's file, with a drift check in CI), checks `normal` and `randint` against the C and CUDA fixtures in `tests/cross_derived.json` (written by `tools/convert_c_fixtures.py`, rejections included), checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
 `jax.random.bits` with reference stream dumps in `tests/data`,
 fork children at traced positions, split children for indices up to 2^64 - 1 against a direct evaluation of F,
 and runs the key implementation under `jit` and `vmap`.

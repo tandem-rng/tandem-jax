@@ -21,7 +21,7 @@ from jax.extend.random import define_prng_impl
 from . import _core
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
-__all__ = ["impl", "impl_for", "key", "key_data", "split", "sub", "stream", "uniform", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
+__all__ = ["impl", "impl_for", "key", "key_data", "split", "sub", "stream", "uniform", "stream_normal", "normal", "stream_randint", "randint", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
 
 K = 32
 """The chunk length of the default key implementation: the canonical Tandem8x32-K32."""
@@ -265,3 +265,168 @@ def fork(k, position, n):
     (n,), and the parent's new position. Works under `jit` with a traced position."""
     kids, new_position = fork_words(k, position, n)
     return jax.random.wrap_key_data(kids, impl=impl_for(_chunk_length(k))), new_position
+
+
+# Appendix A of the specification: draws derived from the uniform stream. Not normative, but
+# every port follows it so that they agree.
+
+PURPOSE_BELOW32 = 0x424C573332
+PURPOSE_BELOW64 = 0x424C573634
+_RETRY_BLOCK = 256
+
+_TWO_PI = {  # 2 pi as a high and low part, so the reduced angle is good to the last bit
+    jnp.dtype("float64"): (6.283185307179586, 2.4492935982947064e-16),
+    jnp.dtype("float32"): (6.2831855, -1.7484555e-7),
+}
+
+
+def _default_float():
+    return jnp.dtype("float64" if jax.config.jax_enable_x64 else "float32")
+
+
+def _position(position):
+    return jnp.asarray(position, jnp.uint64 if jax.config.jax_enable_x64 else U32)
+
+
+def stream_normal(k, position, n, dtype=None):
+    """`n` standard normals from stream bit `position` by Box-Muller, and the position after
+    them. Pair `j` is elements `2j` and `2j + 1`, `(r cos 2 pi b, r sin 2 pi b)` with
+    `r = sqrt(-2 log(1 - a))`, from uniform draws `2j` (`a`) and `2j + 1` (`b`). The fill
+    consumes `2 ceil(n / 2)` draws and an odd `n` drops the last sin half. float32 is computed
+    in float32. `n = 0` leaves the position unchanged."""
+    dtype = jnp.dtype(dtype if dtype is not None else _default_float())
+    if dtype not in _TWO_PI:
+        raise TypeError(f"normal needs float32 or float64, got {dtype}")
+    if n == 0:
+        return jnp.zeros(0, dtype), _position(position)
+    u, pos = stream(k, position, 2 * ((n + 1) // 2), dtype)
+    a, b = u[0::2], u[1::2]
+    r = jnp.sqrt(-2 * jnp.log(1 - a))
+    # Reduce to a quadrant and an angle in [-1/8, 1/8] of a turn first: b - q / 4 is exact, so
+    # no precision is lost to the large angle.
+    q = (b * 4 + 0.5).astype(jnp.int32)
+    f = b - q.astype(dtype) * 0.25
+    hi, lo = _TWO_PI[dtype]
+    th = f * dtype.type(hi) + f * dtype.type(lo)
+    c0, s0 = jnp.cos(th), jnp.sin(th)
+    q = q & 3
+    c = jnp.where(q == 0, c0, jnp.where(q == 1, -s0, jnp.where(q == 2, -c0, s0)))
+    s = jnp.where(q == 0, s0, jnp.where(q == 1, c0, jnp.where(q == 2, -s0, -c0)))
+    return jnp.stack([r * c, r * s], axis=-1).reshape(-1)[:n], pos
+
+
+def normal(k, shape=(), dtype=None, position=0):
+    """Standard normals of `shape` from stream bit `position`, as `stream_normal` returns
+    them. Same call shape as `jax.random.normal`, with different values. Returns the array only."""
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    return stream_normal(k, position, math.prod(shape), dtype)[0].reshape(shape)
+
+
+def _mulhilo64(x, r):
+    """Low and high 64-bit halves of the 128-bit product of two uint64 arrays."""
+    mul = _core._mul_wide
+    (x0, x1), (r0, r1) = _words(x), _words(r)
+    ll0, ll1 = mul(x0, r0)
+    lh0, lh1 = mul(x0, r1)
+    hl0, hl1 = mul(x1, r0)
+    hh0, hh1 = mul(x1, r1)
+    u64 = jnp.uint64
+    mid = ll1.astype(u64) + lh0.astype(u64) + hl0.astype(u64)
+    lo = ll0.astype(u64) | (mid << u64(32))
+    hi = (hh0.astype(u64) | (hh1.astype(u64) << u64(32))) + lh1.astype(u64) + hl1.astype(u64) + (mid >> u64(32))
+    return lo, hi
+
+
+def _lemire(x, r, t, w):
+    """High word of the product and whether Lemire's method rejects the draw `x`."""
+    lo, hi = _core._mul_wide(x, r) if w == 32 else _mulhilo64(x, r)
+    return jnp.where(r == 0, 0, hi), (lo < t) & (r != 0)
+
+
+def _threshold(r, w):
+    zero, one = (U32(0), U32(1)) if w == 32 else (jnp.uint64(0), jnp.uint64(1))
+    return (zero - r) % jnp.where(r == 0, one, r)
+
+
+def _fallback_draw(child, d, w, K):
+    """Draw `d` of the streams of the child keys `child` (four arrays), from position 0."""
+    word = d if w == 32 else d * 2
+    block, offset = word >> 2, word & 3
+    row, lane = block >> 3, block & 7
+    shift = K.bit_length() - 1
+    chunk = (row >> shift) * 8 + lane
+    shape = child[0].shape
+    o, h = _core.F_keyed(child, (jnp.full(shape, chunk, U32), jnp.zeros(shape, U32)), _core.DOMAIN_STREAM, _core.AUX_STREAM)
+    o, h = lax.fori_loop(jnp.int32(0), ((row & (K - 1)) + 1).astype(jnp.int32), lambda _, s: _core.T(*s), (o, h))
+    words = jnp.stack(o)
+    if w == 32:
+        return words[offset]
+    return words[offset].astype(jnp.uint64) | (words[offset + 1].astype(jnp.uint64) << jnp.uint64(32))
+
+
+def _retry(key, idx, pending, r, t, w, K):
+    """Bounded draws of the elements `idx` that took the fallback: element `i` retries on
+    split(i) of sub(PURPOSE) of the fill's key at position 0, draw after draw until Lemire accepts."""
+    purpose = PURPOSE_BELOW32 if w == 32 else PURPOSE_BELOW64
+    lo, hi = U32(purpose & 0xFFFFFFFF), U32(purpose >> 32)
+    o, _ = F_keyed(key, (lo, hi), DOMAIN_FOLD, 0)
+    child = _split_words(o, idx)
+    child = tuple(child[..., i] for i in range(4))
+
+    def body(s):
+        d, val, pend = s
+        v, rej = _lemire(_fallback_draw(child, d, w, K), r, t, w)
+        return d + U32(1), jnp.where(pend, v, val), pend & rej
+
+    init = (U32(0), jnp.zeros(idx.shape, jnp.uint32 if w == 32 else jnp.uint64), pending)
+    return lax.while_loop(lambda s: s[2].any(), body, init)[1]
+
+
+def stream_randint(k, position, n, minval, maxval, dtype=None):
+    """`n` integers uniform on [minval, maxval) from stream bit `position`, and the position
+    after them, by Lemire's method as in Appendix A. Element `i` uses uniform draw `i`, 32 bits
+    for dtypes up to 32 bits and 64 bits otherwise, and a rejected draw retries on a fallback
+    stream. `n` draws are consumed. `maxval <= minval` gives `minval`. `n = 0` leaves the
+    position unchanged. `minval` and `maxval` are scalars or arrays of length `n`."""
+    dtype = jnp.dtype(dtype if dtype is not None else jnp.int64 if jax.config.jax_enable_x64 else jnp.int32)
+    if not jnp.issubdtype(dtype, jnp.integer):
+        raise TypeError(f"randint needs an integer dtype, got {dtype}")
+    w = 64 if dtype.itemsize == 8 else 32
+    wide = jnp.dtype(f"uint{w}")
+    lo_s, hi_s = jnp.asarray(minval, dtype), jnp.asarray(maxval, dtype)
+    lo_u, hi_u = lo_s.astype(wide), hi_s.astype(wide)
+    r = jnp.where(hi_s > lo_s, hi_u - lo_u, wide.type(0))
+    if n == 0:
+        return jnp.zeros(0, dtype), _position(position)
+    draws, pos = stream(k, position, n, wide)
+    t = _threshold(r, w)
+    plain, rej = _lemire(draws, r, t, w)
+    chunk, key = _chunk_length(k), tuple(key_data(k))
+    index = jnp.uint64 if n > 2**32 else U32
+    if n > 2**32 and not jax.config.jax_enable_x64:
+        raise ValueError(f"{n} elements need jax_enable_x64, the index exceeds 32 bits")
+    pick = (lambda a, i: a[i]) if r.ndim else (lambda a, i: a)
+    count = rej.sum(dtype=jnp.int32)
+
+    def few(_):
+        idx = jnp.nonzero(rej, size=min(_RETRY_BLOCK, n), fill_value=0)[0].astype(index)
+        active = jnp.arange(idx.shape[0]) < count
+        fixed = _retry(key, idx, active, pick(r, idx), pick(t, idx), w, chunk)
+        return plain.at[jnp.where(active, idx, n)].set(fixed, mode="drop")
+
+    def many(_):
+        fixed = _retry(key, jnp.arange(n, dtype=index), rej, r, t, w, chunk)
+        return jnp.where(rej, fixed, plain)
+
+    branches = [lambda _: plain, few] + ([many] if n > _RETRY_BLOCK else [])
+    val = lax.switch((count > 0).astype(jnp.int32) + (count > _RETRY_BLOCK).astype(jnp.int32), branches, None)
+    return (lo_u + val).astype(dtype), pos
+
+
+def randint(k, shape, minval, maxval, dtype=None, position=0):
+    """Integers of `shape` uniform on [minval, maxval) from stream bit `position`, as
+    `stream_randint` returns them. Same call shape as `jax.random.randint`, with different
+    values. The bounds may be arrays that broadcast to `shape`. Returns the array only."""
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    flat = lambda a: a if jnp.ndim(a) == 0 else jnp.broadcast_to(a, shape).reshape(-1)
+    return stream_randint(k, position, math.prod(shape), flat(minval), flat(maxval), dtype)[0].reshape(shape)

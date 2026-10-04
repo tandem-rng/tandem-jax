@@ -338,3 +338,89 @@ def test_cross_port_fixture_from_c_reference():
         if int(u) < 2**32:
             assert np.array_equal(np.array(jax.random.key_data(jax.random.fold_in(k, int(u)))), words(want))
         assert np.array_equal(np.array(got), words(want)), u
+
+
+D = json.loads((HERE / "cross_derived.json").read_text())
+ULP32 = 2.0**-23
+
+
+def close(got, want, dtype, ulps32=8):
+    got, want = np.array(got), np.array(want, dtype)
+    tol = 1e-12 * np.abs(want) if dtype == np.float64 else ulps32 * ULP32 * np.abs(want) + 1e-6
+    assert (np.abs(got - want) <= tol).all(), np.abs(got - want).max()
+
+
+def test_normal_pairs_match_c_reference():
+    k = tj.key(42)
+    for dtype, name, end in ((jnp.float64, "pairs64", "pairs64_end_pos"), (jnp.float32, "pairs32", "pairs32_end_pos")):
+        z, pos = tj.stream_normal(k, 1, len(D[name]), dtype)
+        assert z.dtype == np.dtype(dtype) and int(pos) == D[end]
+        close(z, D[name], np.dtype(dtype).type)
+
+
+def test_normal_fills_match_cuda_fixtures():
+    k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)
+    for name, dtype, w in (("device_normal64", jnp.float64, 64), ("device_normal32", jnp.float32, 32)):
+        for c in D[name]:
+            z, pos = tj.stream_normal(k, c["pos"], c["n"], dtype)
+            close(z, c["out"], np.dtype(dtype).type)
+            start = (c["pos"] + w - 1) // w * w
+            assert int(pos) == start + w * 2 * ((c["n"] + 1) // 2)
+            assert np.array_equal(np.array(tj.normal(k, c["n"], dtype, c["pos"])), np.array(z))
+
+
+def test_normal_edge_cases():
+    k = tj.key(42)
+    z, pos = tj.stream_normal(k, 5, 0, jnp.float64)
+    assert z.shape == (0,) and int(pos) == 5
+    odd, pos_odd = tj.stream_normal(k, 0, 5, jnp.float64)
+    even, pos_even = tj.stream_normal(k, 0, 6, jnp.float64)
+    assert np.array_equal(np.array(odd), np.array(even[:5])) and int(pos_odd) == int(pos_even) == 6 * 64
+    big = tj.normal(k, (200_000,), jnp.float64)
+    assert abs(float(big.mean())) < 0.01 and abs(float(big.std()) - 1) < 0.01
+    f = jax.jit(lambda k, p: tj.stream_normal(k, p, 100, jnp.float32)[0])
+    # Fusion may change the last bit of a float32 sin or cos.
+    close(f(k, jnp.uint64(640)), np.array(tj.stream_normal(k, 640, 100, jnp.float32)[0]), np.float32, ulps32=2)
+    with pytest.raises(TypeError):
+        tj.normal(k, (2,), jnp.float16)
+
+
+@pytest.mark.parametrize("name, dtype", [("fill_below32", jnp.uint32), ("fill_below64", jnp.uint64)])
+def test_randint_matches_c_fills(name, dtype):
+    k = tj.key(42)
+    for c in D[name]:
+        got, pos = tj.stream_randint(k, 1, len(c["out"]), 0, c["range"], dtype)
+        assert np.array_equal(np.array(got), np.array(c["out"], dtype)), c["range"]
+        assert int(pos) == c["end_pos"]
+
+
+@pytest.mark.parametrize("name, dtype", [("device_below32", jnp.uint32), ("device_below64", jnp.uint64)])
+def test_randint_matches_cuda_fills_with_rejections(name, dtype):
+    k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)
+    assert max(c["rejected"] for c in D[name]) > 30
+    for c in D[name]:
+        want = np.array(c["out"], dtype)
+        assert np.array_equal(np.array(tj.stream_randint(k, 0, 64, 0, c["range"], dtype)[0]), want), c["range"]
+        assert np.array_equal(np.array(tj.randint(k, (64,), 0, c["range"], dtype)), want)
+
+
+def test_randint_bounds_dtypes_and_heavy_rejection():
+    k = tj.key(42)
+    x = tj.randint(k, (1000,), -5, 7, jnp.int8)
+    assert x.dtype == jnp.int8 and int(x.min()) >= -5 and int(x.max()) < 7 and len(np.unique(np.array(x))) == 12
+    assert np.array_equal(np.array(tj.randint(k, (50,), 3, 3, jnp.int32)), np.full(50, 3))
+    assert np.array_equal(np.array(tj.randint(k, (50,), 9, 3, jnp.int32)), np.full(50, 9))
+    lo, hi = jnp.arange(300, dtype=jnp.int32), jnp.arange(300, dtype=jnp.int32) + 1
+    assert np.array_equal(np.array(tj.randint(k, (300,), lo, hi, jnp.int32)), np.arange(300))
+    s, pos = tj.stream_randint(k, 7, 0, 0, 10, jnp.int32)
+    assert s.shape == (0,) and int(pos) == 7
+    # A range of 2^31 + 1 rejects about half the draws. 4000 elements exceed the compact retry
+    # block, so the full path runs, and its first 64 elements must equal the compact path's.
+    r, n = 2**31 + 1, 4000
+    full = np.array(tj.stream_randint(k, 0, n, 0, r, jnp.uint32)[0])
+    assert (full < r).all()
+    plain = (np.array(tj.stream(k, 0, n, jnp.uint32)[0]).astype(np.uint64) * r) >> 32
+    assert 0.3 < np.mean(plain == full) < 0.7
+    assert np.array_equal(np.array(tj.stream_randint(k, 0, 64, 0, r, jnp.uint32)[0]), full[:64])
+    j = jax.jit(lambda k, p: tj.stream_randint(k, p, 100, -50, 50, jnp.int64)[0])
+    assert np.array_equal(np.array(j(k, jnp.uint64(64))), np.array(tj.stream_randint(k, 64, 100, -50, 50, jnp.int64)[0]))
