@@ -17,6 +17,7 @@ kid = tj.split(key, 2**40 + 5)                     # the spec's split child for 
 u = tj.uniform(key, (1000,), jnp.float32)          # like jax.random.uniform, with the spec's mapping
 z = tj.normal(key, (1000,), jnp.float32)           # Box-Muller normals, Appendix A
 r = tj.randint(key, (1000,), 0, 6, jnp.int32)      # Lemire bounded integers, Appendix A
+e = tj.exponential(key, (1000,), jnp.float32)      # exponentials -ln(1 - u), Appendix A
 x, pos = tj.stream(key, 0, 2**20, jnp.float64)     # the spec's Float64 draws, and the position after
 y, pos = tj.stream(key, pos, 100, jnp.uint8)       # continue at that position, aligned per the spec
 kids, pos = tj.fork(key, pos, 4)                   # the spec's fork at the current block, typed keys, jit-safe
@@ -71,6 +72,10 @@ includes the largest value, so `randint(key, n, 0, 256, jnp.uint8)` gives every 
 `width=32` needs ranges of at most 2^32. Bounded integers, uniforms and `float64` normals are
 exact across ports. `float32` normals agree to the tolerance of Appendix A. Neither equals
 `jax.random.normal` or `jax.random.randint`.
+
+`tj.exponential(key, shape, dtype, position=0)` and `stream_exponential(key, position, n, dtype)`
+give `-ln(1 - u)` of one uniform draw each, as Appendix A defines them, exact across ports in
+`float64` and `float32`. `n = 0` leaves the position unchanged.
 
 64-bit types need `jax.config.update("jax_enable_x64", True)`.
 

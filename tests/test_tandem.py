@@ -425,6 +425,37 @@ def test_normal_edge_cases():
         tj.normal(k, (2,), jnp.float16)
 
 
+def _exponential_rows():
+    k = tj.key(42)
+    for name, dtype in (("exponential64", np.float64), ("exponential32", np.float32)):
+        for c in D[name]:
+            z, pos = tj.stream_exponential(k, c["start"], len(c["out"]), dtype)
+            assert z.dtype == dtype and int(pos) == c["end_pos"], (name, c["start"])
+            assert np.array_equal(np.array(z), np.array(c["out"], dtype)), (name, c["start"])
+
+
+def test_exponential_equals_the_c_reference_bit_for_bit(monkeypatch):
+    # tandem-c's tests/cross_exponential.h, on the native fills where they load and on the XLA path.
+    _exponential_rows()
+    monkeypatch.setattr(tj._ffi, "tandem_jax_cpu", None)
+    monkeypatch.setattr(tj._ffi, "tandem_jax_cuda", None)
+    jax.clear_caches()
+    try:
+        _exponential_rows()
+    finally:
+        monkeypatch.undo()
+        jax.clear_caches()
+
+
+def test_exponential_edge_cases():
+    k = tj.key(42)
+    z, pos = tj.stream_exponential(k, 5, 0, jnp.float64)
+    assert z.shape == (0,) and int(pos) == 5
+    assert np.array_equal(np.array(tj.exponential(k, (2, 3), jnp.float32, 7)), np.array(tj.stream_exponential(k, 7, 6, jnp.float32)[0]).reshape(2, 3))
+    with pytest.raises(TypeError):
+        tj.exponential(k, (2,), jnp.float16)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float64, jnp.float32])
 def test_normal_moments_and_ks(dtype):
     # Bounds are five standard errors for the moments and the 0.1% KS critical value.
@@ -641,13 +672,14 @@ def test_cuda_kernels_equal_the_xla_path(K):
     typed = lambda kd: jax.random.wrap_key_data(kd, impl=tj.impl_for(K))
     draws = [(lambda d: lambda kd, p, n: tj.stream(typed(kd), p, n, d)[0])(d) for d in ("uint32", "int32", "float32", "uint64", "int64", "float64")]
     normals = [(lambda d: lambda kd, p, n: tj.stream_normal(typed(kd), p, n, d)[0])(d) for d in ("float32", "float64")]
+    exps = [(lambda d: lambda kd, p, n: tj.stream_exponential(typed(kd), p, n, d)[0])(d) for d in ("float32", "float64")]
     bounded = [
         (lambda a, b, d, w: lambda kd, p, n: tj.stream_randint(typed(kd), p, n, a, b, d, w)[0])(*c)
         for c in ((0, 1000, "int32", None), (-7, 2**31 + 1, "int64", None), (0, 2**32, "int64", None), (3, 2**40, "int64", None),
                   (0, 2**63 + 1, "uint64", None), (5, 5, "int32", None), (-9, 1000, "int32", 64), (3, 250, "uint8", None))
     ]
     for n in (7, 70001):
-        for i, f in enumerate(draws + normals + bounded):
+        for i, f in enumerate(draws + normals + exps + bounded):
             g = lambda kd, p: f(kd, p, n)
             for p in (0, 1, 12345, 2**33 + 7):
                 got, want = _run_on(gpu, g, kd, jnp.uint64(p)), _run_on(cpu, g, kd, jnp.uint64(p))
@@ -676,8 +708,8 @@ def test_cuda_kernels_batch_under_vmap():
 @cuda_only
 def test_cuda_lowers_to_the_kernels():
     k = tj.key(1)
-    f = lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))
-    assert jax.jit(f).lower().compile().as_text().count('custom_call_target="tandem_fill"') == 4
+    f = lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.exponential(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))
+    assert jax.jit(f).lower().compile().as_text().count('custom_call_target="tandem_fill"') == 5
     with jax.default_device(jax.devices("cpu")[0]):
         assert ("tandem_fill" in jax.jit(f).lower().compile().as_text()) == CPU
 
@@ -708,12 +740,13 @@ def test_cpu_fills_equal_the_xla_path(K, monkeypatch):
     dtypes = ("uint8", "int8", "uint16", "float16", "uint32", "int32", "float32", "uint64", "int64", "float64")
     draws = [(lambda d: lambda kd, p, n: tj.stream(typed(kd), p, n, d)[0])(d) for d in dtypes]
     normals = [(lambda d: lambda kd, p, n: tj.stream_normal(typed(kd), p, n, d)[0])(d) for d in ("float32", "float64")]
+    exps = [(lambda d: lambda kd, p, n: tj.stream_exponential(typed(kd), p, n, d)[0])(d) for d in ("float32", "float64")]
     bounded = [
         (lambda a, b, d, w: lambda kd, p, n: tj.stream_randint(typed(kd), p, n, a, b, d, w)[0])(*c)
         for c in ((0, 1000, "int32", None), (-7, 2**31 + 1, "int64", None), (0, 2**32, "int64", None), (3, 2**40, "int64", None),
                   (0, 2**63 + 1, "uint64", None), (5, 5, "int32", None), (-9, 1000, "int32", 64), (3, 250, "uint8", None))
     ]
-    cases = [(f, n, p) for f in draws + normals + bounded for n in (7, 300001) for p in (1, 2**33 + 7)]
+    cases = [(f, n, p) for f in draws + normals + exps + bounded for n in (7, 300001) for p in (1, 2**33 + 7)]
     run = lambda: [_run_on(cpu, lambda kd, p: f(kd, p, n), kd, jnp.uint64(p)) for f, n, p in cases]
     got, want = run(), _without_cpu_extension(monkeypatch, run)
     for (f, n, p), g, w in zip(cases, got, want):
@@ -750,6 +783,6 @@ def test_cpu_fills_batch_under_vmap():
 def test_cpu_lowers_to_the_fills(monkeypatch):
     with jax.default_device(jax.devices("cpu")[0]):
         k = tj.key(1)
-        f = lambda: jax.jit(lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))).lower().compile().as_text()
-        assert f().count('custom_call_target="tandem_fill"') == 4
+        f = lambda: jax.jit(lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.exponential(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))).lower().compile().as_text()
+        assert f().count('custom_call_target="tandem_fill"') == 5
         assert "tandem_fill" not in _without_cpu_extension(monkeypatch, f)

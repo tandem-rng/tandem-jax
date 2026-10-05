@@ -30,6 +30,7 @@ k1, k2 = jax.random.split(key)                     # the spec's split by index
 z = jax.random.normal(k1, (1000,))                 # any jax.random function
 x, pos = tj.stream(key, 0, 2**20, jnp.float64)     # Float64 draws, and the position after
 r = tj.randint(key, (1000,), 0, 6, jnp.int32)      # Lemire bounded integers
+e = tj.exponential(key, (1000,))                   # exponentials -ln(1 - u), Appendix A
 kids, pos = tj.fork(key, pos, 4)                   # the spec's fork, typed keys, jit-safe
 ```
 

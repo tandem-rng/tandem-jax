@@ -37,7 +37,7 @@ def _words(x):
 def fill(key, position, n, dtype, chunk, kind, bound=0, low=0, width=0):
     """`n` elements of `dtype` at stream bit `position` from the fill `kind`: "stream" for the
     spec's draws, "below" for bounded integers `low + [0, bound)` of draw width `width` (0 takes it
-    from the bound), "normal" for Box-Muller normals."""
+    from the bound), "normal" for normals, "exponential" for exponentials."""
     prm = jnp.concatenate([jnp.asarray(key, U32), jnp.stack(_words(position) + _words(bound) + _words(low))])
     call = jax.ffi.ffi_call("tandem_fill", jax.ShapeDtypeStruct((n,), dtype), vmap_method="broadcast_all")
     return call(prm, n=np.int64(n), chunk=np.int64(chunk), kind=kind, width=np.int32(width))

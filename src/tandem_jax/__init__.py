@@ -23,7 +23,7 @@ from jax.extend.random import define_prng_impl
 from . import _core, _ffi
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
-__all__ = ["impl", "impl_for", "key", "key_data", "split", "sub", "stream", "uniform", "stream_normal", "normal", "stream_randint", "randint", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
+__all__ = ["impl", "impl_for", "key", "key_data", "split", "sub", "stream", "uniform", "stream_normal", "normal", "stream_exponential", "exponential", "stream_randint", "randint", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
 
 K = 32
 """The chunk length of the default key implementation: the canonical Tandem8x32-K32."""
@@ -394,17 +394,23 @@ def _two_sum(a, b):
     return s, (a - (s - t)) + (b - t)
 
 
+def _uint(a):
+    return jnp.dtype(f"uint{a.dtype.itemsize * 8}")
+
+
 def _halves(a):
-    """`a` as a 26-bit high part, rounded on the bits, and the exact rest of at most 26 bits."""
-    bits = lax.bitcast_convert_type(a, jnp.uint64)
-    hi = lax.bitcast_convert_type((bits + jnp.uint64(1 << 26)) & ~jnp.uint64((1 << 27) - 1), jnp.float64)
+    """`a` as a high part of half its significand (26 bits in float64, 12 in float32), rounded on
+    the bits, and the exact rest of at most as many bits."""
+    u = _uint(a)
+    cut = (jnp.finfo(a.dtype).nmant + 2) // 2
+    bits = lax.bitcast_convert_type(a, u)
+    hi = lax.bitcast_convert_type((bits + u.type(1 << (cut - 1))) & ~u.type((1 << cut) - 1), a.dtype)
     return hi, a - hi
 
 
 def _two_prod(a, b):
     """Dekker's product: `p + e == a * b` exactly. The partial products are exact, so a fused
     multiply-add over them gives the same bits."""
-    a, b = jnp.asarray(a, jnp.float64), jnp.asarray(b, jnp.float64)
     p = _alone(a * b)
     ah, al = _halves(a)
     bh, bl = _halves(b)
@@ -412,17 +418,19 @@ def _two_prod(a, b):
 
 
 def _fma(a, b, c):
-    """`a * b + c` rounded once, by Boldo and Melquiond's emulation with a sum rounded to odd
-    (IEEE Trans. Computers 57, 2008). It needs no underflow, which the logarithm's operands avoid."""
-    b, c = _opaque(b, a), _opaque(c, a)
+    """`a * b + c` rounded once in the dtype of the array `a`, by Boldo and Melquiond's emulation
+    with a sum rounded to odd (IEEE Trans. Computers 57, 2008). It needs no underflow, which the
+    logarithm's operands avoid."""
+    b, c = (_opaque(v, a).astype(a.dtype) for v in (b, c))
     uh, ul = _two_prod(a, b)
     th, tl = _two_sum(c, uh)
     s, e = _two_sum(tl, ul)
-    bits = lax.bitcast_convert_type(s, jnp.uint64)
+    u = _uint(a)
+    bits = lax.bitcast_convert_type(s, u)
     # Round to odd: an inexact sum with an even last bit moves one ulp toward the exact one.
-    step = jnp.where((e > 0) == (s > 0), jnp.uint64(1), jnp.uint64(2**64 - 1))
-    bits = jnp.where((e != 0) & ((bits & jnp.uint64(1)) == 0), bits + step, bits)
-    return th + lax.bitcast_convert_type(bits, jnp.float64)
+    step = jnp.where((e > 0) == (s > 0), u.type(1), ~u.type(0))
+    bits = jnp.where((e != 0) & ((bits & u.type(1)) == 0), bits + step, bits)
+    return th + lax.bitcast_convert_type(bits, a.dtype)
 
 
 def _neg2_log(x):
@@ -596,6 +604,66 @@ def normal(k, shape=(), dtype=None, position=0):
     them. Same call shape as `jax.random.normal`, with different values. Returns the array only."""
     shape = (shape,) if isinstance(shape, int) else tuple(shape)
     return stream_normal(k, position, math.prod(shape), dtype)[0].reshape(shape)
+
+
+def _div_f32(a, b):
+    """`a / b` rounded once in float32, for normal b > 0. XLA's GPU backend divides float32 to
+    about 2 ulps. Each round moves the quotient one float toward the exact one while the residual
+    `a - q b` exceeds half the gap. Within 1 ulp the residual is exact, so the last move is right."""
+    q = a / b
+    for _ in range(3):
+        p, e = _two_prod(q, b)
+        r = (a - p) - e
+        nxt = jnp.nextafter(q, jnp.where(r > 0, jnp.float32(np.inf), jnp.float32(-np.inf)))
+        q = jnp.where(2 * jnp.abs(r) > jnp.abs(nxt - q) * b, nxt, q)
+    return q
+
+
+def _neg2_log_f32(x):
+    """The float32 form of the reference logarithm in tandem-c, -2 ln x for float32 x in (0, 1]."""
+    ix = lax.bitcast_convert_type(x, U32) + U32(0x004AFB0D)
+    nk = (127 - (ix >> U32(23)).astype(jnp.int32)).astype(jnp.float32)
+    m = lax.bitcast_convert_type((ix & U32(0x007FFFFF)) + U32(0x3F3504F3), jnp.float32)
+    s = _div_f32(m - 1.0, m + 1.0)
+    z = _alone(s * s)
+    p = _fma(z, np.float32(0.14275366), np.float32(0.20000061))
+    p = _fma(z, _fma(z, p, np.float32(0.33333334)), np.float32(1.0))
+    return _fma(nk, np.float32(2.857213530660374e-06), _fma(nk, np.float32(1.38629150390625), _alone((s * -4.0) * p)))
+
+
+def stream_exponential(k, position, n, dtype=None):
+    """`n` standard exponentials `-ln(1 - u)` from stream bit `position`, one uniform draw `u` of
+    `dtype` each as Appendix A defines them, and the position after them. They halve the reference
+    logarithm, in float32 its float32 form, and equal tandem-c bit for bit. `n = 0` leaves the
+    position unchanged."""
+    dtype = jnp.dtype(dtype if dtype is not None else _default_float())
+    if dtype not in (jnp.dtype("float32"), jnp.dtype("float64")):
+        raise TypeError(f"exponential needs float32 or float64, got {dtype}")
+    position = _position(position)
+    if n == 0:
+        return jnp.zeros(0, dtype), position
+    return _exponential(key_data(k), position, n, dtype, _chunk_length(k))
+
+
+@functools.partial(jax.jit, static_argnames=("n", "dtype", "chunk"))
+def _exponential(key, position, n, dtype, chunk):
+    w = 8 * dtype.itemsize
+
+    def xla():
+        u, _ = stream(key, position, n, dtype, chunk)
+        log = _neg2_log if w == 64 else _neg2_log_f32
+        return 0.5 * log(1.0 - u)
+
+    call = lambda: _ffi.fill(key, position, n, dtype, chunk, "exponential")
+    out = _ffi.native(chunk >= _ffi.TILE_STEPS, True, call, xla)
+    return out, _align(position, w) + w * n
+
+
+def exponential(k, shape=(), dtype=None, position=0):
+    """Standard exponentials of `shape` from stream bit `position`, as `stream_exponential` returns
+    them. Same call shape as `jax.random.exponential`, with different values. Returns the array only."""
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    return stream_exponential(k, position, math.prod(shape), dtype)[0].reshape(shape)
 
 
 def _mulhilo64(x, r):

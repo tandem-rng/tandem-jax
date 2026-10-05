@@ -1,10 +1,10 @@
 /* The tandem-cuda fills as one XLA FFI handler, run on the stream XLA hands over.
  *
- * The kernels are the tile and normal kernels of tandem.cuh, with the key, the position and the
- * bounds read from device memory instead of taken as kernel arguments. Under jit they are traced
- * values, and copying them to the host would stall the stream. The geometry of a fill depends on
- * the position, so each kernel derives it on the device, and the grid is sized for the worst
- * alignment: blocks past the fill exit before any work.
+ * The kernels are the tile and normal kernels of tandem.cuh, exponentials included, with the key,
+ * the position and the bounds read from device memory instead of taken as kernel arguments. Under
+ * jit they are traced values, and copying them to the host would stall the stream. The geometry of
+ * a fill depends on the position, so each kernel derives it on the device, and the grid is sized
+ * for the worst alignment: blocks past the fill exit before any work.
  *
  * Batched calls (vmap) carry one parameter row per fill and write the fills back to back, row b
  * to out + b n, as grid row b.
@@ -113,8 +113,7 @@ __global__ void __launch_bounds__(THREADS)
     fill_tile<E>(tile, load(prm + PARAMS * row), K, n, Bound{0, 0, 0}, out + n * row);
 }
 
-/* `width` 0 takes the draw width from the range, 64 bits above 2^32. tandem.cuh stores outputs as
- * wide as the draw or wider, so 64-bit draws need a 64-bit O. */
+/* `width` 0 takes the draw width from the range, 64 bits above 2^32, which needs a 64-bit O. */
 template <class O>
 __global__ void __launch_bounds__(THREADS)
     below_kernel(const uint32_t *prm, uint32_t K, uint64_t n, uint64_t row0, int width, O *out) {
@@ -460,8 +459,15 @@ ffi::Error Fill(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::Buffer<
                     p, K, m, row0, (float *)o);
             else
                 return ffi::Error::InvalidArgument("tandem_fill: normal needs f32 or f64");
+        } else if (kind == "exponential") {
+            if (t == D::F32)
+                fill_kernel<exp_f32><<<dim3(tile_grid(m, 32, K), y), THREADS, 0, stream>>>(p, K, m, row0, (float *)o);
+            else if (t == D::F64)
+                fill_kernel<exp_f64><<<dim3(tile_grid(m, 64, K), y), THREADS, 0, stream>>>(p, K, m, row0, (double *)o);
+            else
+                return ffi::Error::InvalidArgument("tandem_fill: exponential needs f32 or f64");
         } else {
-            return ffi::Error::InvalidArgument("tandem_fill: kind must be stream, below or normal");
+            return ffi::Error::InvalidArgument("tandem_fill: kind must be stream, below, normal or exponential");
         }
     }
     cudaError_t e = cudaGetLastError();

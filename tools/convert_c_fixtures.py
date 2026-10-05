@@ -37,7 +37,7 @@ def scalar(text, name):
 tests = Path(sys.argv[1])
 scalar_below = (tests / "cross_below.h").read_text()
 cuda_tests = Path(sys.argv[2])
-fill, normal = ((tests / f).read_text() for f in ("cross_fill_below.h", "cross_normal.h"))
+fill, normal, expo = ((tests / f).read_text() for f in ("cross_fill_below.h", "cross_normal.h", "cross_exponential.h"))
 cuda_below, cuda_normal = ((cuda_tests / f).read_text() for f in ("cross_fill_below.h", "cross_fill_normal.h"))
 out = {
     # Sequential draws after one Bool, so from bit position 1, rejected draws consume the stream.
@@ -50,6 +50,9 @@ out = {
     "normal64": [{"start": s, "out": o, "end_pos": e} for s, o, e in array(normal, "CROSS_NORMAL")],
     "pairs32": array(normal, "CROSS_NORMALF"),
     "pairs32_end_pos": scalar(normal, "CROSS_NORMALF_END_POS"),
+    # Exponential fills of 64 elements from seed 42 at each start.
+    "exponential64": [{"start": s, "out": o, "end_pos": e} for s, o, e in array(expo, "CROSS_EXPONENTIAL")],
+    "exponential32": [{"start": s, "out": o, "end_pos": e} for s, o, e in array(expo, "CROSS_EXPONENTIALF")],
     # Key of seed 42, K = 32, from the CUDA port. `rejected` counts elements on the fallback.
     "device_below32": [{"range": n, "rejected": r, "out": o} for n, r, o in array(cuda_below, "CROSS_BELOW32")],
     "device_below64": [{"range": n, "rejected": r, "out": o} for n, r, o in array(cuda_below, "CROSS_BELOW64")],

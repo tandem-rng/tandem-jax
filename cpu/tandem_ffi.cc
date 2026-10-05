@@ -29,7 +29,7 @@ constexpr uint64_t GRAIN = 128;
 constexpr uint64_t MIN_PART_BYTES = 1u << 18;
 constexpr uint64_t RANGE_2_32 = 1ull << 32;
 
-enum class Kind { stream, below, normal };
+enum class Kind { stream, below, normal, exponential };
 
 struct Params {
     uint32_t key[4];
@@ -125,6 +125,12 @@ struct Job {
             else tandem_fill_normal_f64(&r, (double *)out + first, m);
             break;
         }
+        case Kind::exponential: {
+            tandem_rng r = at(q, K, 8 * (unsigned)ffi::ByteWidth(type), i0);
+            if (type == D::F32) tandem_fill_exponential_f32(&r, (float *)out + first, m);
+            else tandem_fill_exponential_f64(&r, (double *)out + first, m);
+            break;
+        }
         }
     }
 
@@ -165,7 +171,12 @@ ffi::Error check(std::string_view kind, ffi::DataType t, int32_t width, Kind &k)
         if (t != D::F32 && t != D::F64) return ffi::Error::InvalidArgument("tandem_fill: normal needs f32 or f64");
         return ffi::Error::Success();
     }
-    return ffi::Error::InvalidArgument("tandem_fill: kind must be stream, below or normal");
+    if (kind == "exponential") {
+        k = Kind::exponential;
+        if (t != D::F32 && t != D::F64) return ffi::Error::InvalidArgument("tandem_fill: exponential needs f32 or f64");
+        return ffi::Error::Success();
+    }
+    return ffi::Error::InvalidArgument("tandem_fill: kind must be stream, below, normal or exponential");
 }
 
 ffi::Future Fill(ffi::ThreadPool pool, ffi::Buffer<ffi::U32> prm, ffi::Result<ffi::AnyBuffer> out, int64_t n,

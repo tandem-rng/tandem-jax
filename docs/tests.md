@@ -19,7 +19,9 @@ pixi run test     # tests/test_tandem.py
 - compares positioned reads and `jax.random.bits` with reference stream dumps in `tests/data`,
 - checks the `float64` normals bit for bit against tandem-c's `tests/cross_normal.h` at commit
   `121db59` (rows with wedge, redraw and tail misses) and tandem-cuda's
-  `tests/cross_fill_normal.h` at `76eddae`,
+  `tests/cross_fill_normal.h` at `bab9870`,
+- checks `exponential` in `float64` and `float32` bit for bit against tandem-c's
+  `tests/cross_exponential.h`, on the native fills and on the XLA path,
 - checks the ziggurat tables against the spec file's SHA-256,
 - checks that the XLA path's `float64` normals keep their values when the misses run in batches
   of one or three, or finish on a gathered set of one or four,
@@ -47,6 +49,8 @@ and does not without the extension.
 - `tests/cross_port.json` is written by `tools/gen_split_fixture.c`.
 - tandem-c's `tests/cross_normal.h` at commit `121db59` has the SHA-256
   `3cd7c8f9178711255718288eb712eaccb33a1726d2a185f412f13590398ad3ac`.
+- tandem-c's `tests/cross_exponential.h` at commit `121db59` has the SHA-256
+  `da848bae24dae7d1cde6fdb7ef2e6d2953b76b333ba5139800cba3ae03c85efc`.
 
 ## CI
 
