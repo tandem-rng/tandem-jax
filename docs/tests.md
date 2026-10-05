@@ -23,6 +23,8 @@ pixi run test     # tests/test_tandem.py
 - checks the ziggurat tables against the spec file's SHA-256,
 - checks fork children at traced positions, and split children for indices up to 2^64 - 1
   against a direct evaluation of F,
+- checks normal moments to fourth order and a KS test on 10^7 draws, and chi-square uniformity
+  of bounded integers at a range that rejects a quarter of the draws,
 - and runs the key implementation under `jit` and `vmap`.
 
 On a CUDA device with the extension, the whole suite runs on the kernels, and three more tests

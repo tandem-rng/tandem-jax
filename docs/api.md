@@ -32,7 +32,7 @@ alignment, so `bits(key, shape, uint32)` are the stream words and `uint8`, `uint
 
 The key implementation `tj.impl` is the canonical `Tandem8x32-K32`. `tj.impl_for(K)` gives the
 implementation of `Tandem8x32-K<K>` for a power of two from 1 to 65536, and
-`tj.key(seed, chunk_length=K)` makes a typed key of that variant. Children from `split`, `fork`
+`tj.key(seed, chunk_length=K)` makes a typed key of that variant, with `K = 32` by default. Children from `split`, `fork`
 and `stream` follow the parent's variant, and `stream` takes `chunk_length` for raw key words.
 
 `tj.split(key, index)` is the spec's split child for an unsigned index of any width, scalar
