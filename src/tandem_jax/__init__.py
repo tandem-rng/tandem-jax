@@ -448,11 +448,23 @@ def _zig_fast(r):
 
 
 _WEDGE, _REDRAW, _TAIL_A, _TAIL_B = range(4)
-_ZIG_SHARE = 128
-"""The slow path takes up to one element in this many, 1.8 times the expected misses."""
-_ZIG_GROUP = 16
-"""Misses are gathered from groups of this many elements, so that one pass of the gather runs
-over a sixteenth of the fill and the other over an eighth."""
+_ZIG_FEW = 256
+"""The slow path gathers its pending misses into a set of this many once no more than this many
+are pending."""
+
+
+@functools.cache
+def _zig_miss_rate():
+    """The probability that a draw misses the inner rectangles, 0.43 %."""
+    K = _zig_tables()[1]
+    return 1.0 - float(np.mean(K.astype(np.float64))) * 2.0**-53
+
+
+def _zig_batch(n):
+    """The misses of a fill of `n` that one pass of the slow path takes: the expected count with 6
+    standard deviations to spare. More misses take further passes."""
+    m = n * _zig_miss_rate()
+    return min(n, int(m + 6 * math.sqrt(m)) + _RETRY_MAX)
 
 
 def _zig_slow(key, g, r, pending, K):
@@ -463,15 +475,17 @@ def _zig_slow(key, g, r, pending, K):
     Y = jnp.asarray(Y)
     lo, hi = U32(PURPOSE_NORMAL64 & 0xFFFFFFFF), U32(PURPOSE_NORMAL64 >> 32)
     o, _ = F_keyed(key, (lo, hi), DOMAIN_FOLD, 0)
-    child = _split_words(o, g)
-    child = tuple(child[..., w] for w in range(4))
+    # split(g), as _split_words computes it, without the stack that makes XLA compute F per word.
+    hidden, half = (g & jnp.uint64(1)) != 0, g >> jnp.uint64(1)
+    o, h = F_keyed(o, _words(half), DOMAIN_SPLIT, 0, rolled=True)
+    child = tuple(jnp.where(hidden, b, a) for a, b in zip(o, h))
     x, _ = _zig_fast(r)
     layer = lambda r: (r & jnp.uint64(1023)).astype(jnp.int32)
     phase = jnp.where(layer(r) == 0, _TAIL_A, _WEDGE)
     zero = jnp.zeros(g.shape)
 
     def body(st):
-        d, blk, phase, r, x, a, out, pend = st
+        d, child, blk, phase, r, x, a, out, pend = st
         # Draws 2b and 2b + 1 share stream block b, so an odd draw reuses the block of the last.
         blk = lax.cond((d & 1) == 0, lambda: _fallback_block(child, d >> 1, K), lambda: blk)
         odd = (d & 1) == 1
@@ -497,6 +511,7 @@ def _zig_slow(key, g, r, pending, K):
         redraw = pend & (phase == _REDRAW)
         return (
             d + U32(1),
+            child,
             blk,
             jnp.where(pend, after, phase),
             jnp.where(redraw, v, r),
@@ -506,41 +521,74 @@ def _zig_slow(key, g, r, pending, K):
             pend & ~done,
         )
 
-    init = (U32(0), jnp.zeros((4,) + g.shape, U32), phase, r, x, zero, zero, pending)
-    return lax.while_loop(lambda st: st[-1].any(), body, init)[6]
+    st = (U32(0), child, jnp.zeros((4,) + g.shape, U32), phase, r, x, zero, zero, pending)
+    m, few = g.shape[0], _ZIG_FEW
+    if few >= m:
+        return lax.while_loop(lambda st: st[-1].any(), body, st)[7]
+    # Two rounds settle all but a few dozen misses. The rest finish on a gathered set of `few`, as
+    # a round over the whole batch costs as much as the first.
+    st = lax.while_loop(lambda st: st[-1].sum() > few, body, st)
+    sel = jnp.nonzero(st[-1], size=few, fill_value=m)[0]
+    take = lambda a: a[..., jnp.minimum(sel, m - 1)]
+    rest = (st[0], tuple(map(take, st[1])), *map(take, st[2:8]), take(st[8]) & (sel < m))
+    rest = lax.while_loop(lambda st: st[-1].any(), body, rest)
+    return st[7].at[sel].set(rest[7], mode="drop")
+
+
+def _select_bit(w, j):
+    """The index of set bit `j`, counted from 0 at the low end, of each uint32 word `w`."""
+    at = jnp.zeros(w.shape, jnp.int32)
+    for half in (16, 8, 4, 2, 1):
+        low = w & U32((1 << half) - 1)
+        c = lax.population_count(low).astype(j.dtype)
+        up = j >= c
+        j = jnp.where(up, j - c, j)
+        w = jnp.where(up, w >> U32(half), low)
+        at = at + jnp.where(up, half, 0)
+    return at
 
 
 def _ziggurat(key, position, n, chunk):
     r, pos = stream(key, position, n, jnp.uint64, chunk)
     x, miss = _zig_fast(r)
+    # A miss is NaN until the slow path overwrites it. The words below then read x, where they
+    # would repeat the stream's transpose and the table lookups.
+    x = jnp.where(miss, jnp.nan, x)
+    miss = jnp.isnan(x)
     g0 = pos // jnp.uint64(64) - jnp.uint64(n)
-    key = tuple(key)
-    # 0.43 % of the draws miss. The slow path runs on up to cap of them, gathered in two passes:
-    # the groups that hold a miss, then the misses of those groups, of which there are no more
-    # than misses. When more miss than cap, it runs on every element.
-    cap = min(n, max(_RETRY_MAX, n // _ZIG_SHARE))
-    G = _ZIG_GROUP
-    groups = -(-n // G)
-    by_group = jnp.pad(miss, (0, groups * G - n)).reshape(groups, G)
-    hit = by_group.any(1)
-    count, ngroups = miss.sum(), hit.sum()
-    gcap = min(groups, cap)
+    # Bit j of word w marks a miss of element 32 w + j, and a running count over the words locates
+    # miss k by a binary search. Nonzero over the elements, or a gather in passes, took longer
+    # than the fill.
+    it = jnp.int64 if n >= 2**31 else jnp.int32
+    words = -(-n // 32)
+    bits = jnp.pad(miss, (0, 32 * words - n)).reshape(words, 32).astype(U32)
+    bits = (bits << jnp.arange(32, dtype=U32)).sum(1, dtype=U32)
+    ones = lax.population_count(bits).astype(it)
+    end = jnp.cumsum(ones)
+    count = end[-1]
+    cap = _zig_batch(n)
 
-    def few(_):
-        rows = jnp.nonzero(hit, size=gcap, fill_value=0)[0]
-        sel = by_group[rows] & (jnp.arange(gcap) < ngroups)[:, None]
-        flat = jnp.nonzero(sel.reshape(-1), size=cap, fill_value=0)[0]
-        idx = rows[flat // G] * G + flat % G
-        active = jnp.arange(cap) < count
-        fixed = _zig_slow(key, g0 + idx.astype(jnp.uint64), r[idx], active, chunk)
+    def batch(b, x, r):
+        k = b * it(cap) + jnp.arange(cap, dtype=it)
+        w = jnp.minimum(jnp.searchsorted(end, k, side="right"), words - 1).astype(it)
+        idx = 32 * w + _select_bit(bits[w], k - (end[w] - ones[w])).astype(it)
+        active = k < count
+        # A batch without misses skips the slow path. XLA also fuses nothing across the conditional,
+        # so the lookup above runs once, not once per word of the keys derived from it.
+        gi, ri = g0 + idx.astype(jnp.uint64), r[idx]
+        fixed = lax.cond(active[0], lambda: _zig_slow(tuple(key), gi, ri, active, chunk), lambda: jnp.zeros(cap))
         return x.at[jnp.where(active, idx, n)].set(fixed, mode="drop")
 
-    def many(_):
-        fixed = _zig_slow(key, g0 + jnp.arange(n, dtype=jnp.uint64), r, miss, chunk)
-        return jnp.where(miss, fixed, x)
+    # Outside a loop the first batch reads its draws from the stream's own buffer, so the fill never
+    # writes out all of r. The rare later batches draw the stream again. The barrier ties that
+    # draw to the batch, or XLA would hoist it out of the loop and write r again.
+    x = batch(it(0), x, r)
 
-    branches = [lambda _: x, few] + ([many] if n > cap else [])
-    return lax.switch((count > 0).astype(jnp.int32) + (count > cap).astype(jnp.int32), branches, None)
+    def later(st):
+        b, k = lax.optimization_barrier((st[0], key))
+        return b + 1, batch(b, st[1], stream(k, position, n, jnp.uint64, chunk)[0])
+
+    return lax.while_loop(lambda st: st[0] * it(cap) < count, later, (it(1), x))[1]
 
 
 def normal(k, shape=(), dtype=None, position=0):
@@ -582,8 +630,11 @@ def _fallback_block(child, block, K):
     shift = K.bit_length() - 1
     chunk = (row >> shift) * 8 + lane
     shape = child[0].shape
-    o, h = _core.F_keyed(child, (jnp.full(shape, chunk, U32), jnp.zeros(shape, U32)), _core.DOMAIN_STREAM, _core.AUX_STREAM)
-    o, h = lax.fori_loop(jnp.int32(0), ((row & (K - 1)) + 1).astype(jnp.int32), lambda _, s: _core.T(*s), (o, h))
+    counter = (jnp.full(shape, chunk, U32), jnp.zeros(shape, U32))
+    o, h = _core.T(*_core.F_keyed(child, counter, _core.DOMAIN_STREAM, _core.AUX_STREAM, rolled=True))
+    # Fallback draws stay in row 0 almost always. A loop around its single step cost three times the step.
+    steps = (row & (K - 1)).astype(jnp.int32)
+    o, h = lax.cond(steps == 0, lambda: (o, h), lambda: lax.fori_loop(jnp.int32(0), steps, lambda _, s: _core.T(*s), (o, h)))
     return jnp.stack(o)
 
 

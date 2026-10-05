@@ -365,19 +365,27 @@ def test_normal64_equals_the_c_reference_bit_for_bit():
         assert np.array_equal(np.array(z), np.array(c["out"])) and int(pos) == c["end_pos"], c["start"]
 
 
-def test_normal64_slow_path_over_every_element(monkeypatch):
-    # More misses than the gathered set holds send every element through the slow path, which
-    # must give the values of the gathered one.
+@pytest.mark.parametrize("batch, few", [(1, 256), (3, 256), (None, 1), (None, 4)])
+def test_normal64_misses_in_batches_and_gathered_rounds(monkeypatch, batch, few):
+    # More misses than one pass of the slow path takes run in further passes, and the last
+    # pending misses of a pass finish on a gathered set. Both must give the values of one pass
+    # over every miss. The cross_normal.h rows check those values against tandem-c.
     monkeypatch.setattr(tj._ffi, "tandem_jax_cpu", None)
     monkeypatch.setattr(tj._ffi, "tandem_jax_cuda", None)
+    monkeypatch.setattr(tj, "_ZIG_FEW", 2**62)
     jax.clear_caches()
-    f = lambda: np.array(tj.stream_normal(tj.key(42), 12345, 4096, jnp.float64)[0])
-    few = f()
-    monkeypatch.setattr(tj, "_RETRY_MAX", 1)
-    monkeypatch.setattr(tj, "_ZIG_SHARE", 2**62)
+    k = tj.key(42)
+    f = lambda: np.array(tj.stream_normal(k, 12345, 4096, jnp.float64)[0])
+    one = f()
+    if batch is not None:
+        monkeypatch.setattr(tj, "_zig_batch", lambda n: batch)
+    monkeypatch.setattr(tj, "_ZIG_FEW", few)
     jax.clear_caches()
     try:
-        assert np.array_equal(f(), few)
+        assert np.array_equal(f(), one)
+        for c in D["normal64"]:
+            z, _ = tj.stream_normal(k, c["start"], len(c["out"]), jnp.float64)
+            assert np.array_equal(np.array(z), np.array(c["out"])), c["start"]
     finally:
         monkeypatch.undo()
         jax.clear_caches()

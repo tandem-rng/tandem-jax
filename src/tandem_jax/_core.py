@@ -60,13 +60,25 @@ def F(o, h):
     return o, h
 
 
-def F_keyed(key, counter, domain, aux):
+def F_rolled(o, h):
+    """F as a loop of its eight rounds. XLA fuses an unrolled F into each consumer of its eight
+    words and computes it once per word, which a loop's state prevents."""
+
+    def round_(i, s):
+        o, h = T(*s)
+        return h, (o[0] ^ jnp.asarray(RC, U32)[i], o[1], o[2], o[3])
+
+    return lax.fori_loop(0, 8, round_, (tuple(o), tuple(h)))
+
+
+def F_keyed(key, counter, domain, aux, rolled=False):
     """F from the keyed input block. `key` is four uint32 arrays, `counter` two uint32
-    arrays (low, high) of one shape, `domain` and `aux` ints or uint32 arrays."""
+    arrays (low, high) of one shape, `domain` and `aux` ints or uint32 arrays. `rolled` runs
+    F as a loop, for consumers that would compute it once per word."""
     lo, hi = counter
     o = (lo, hi, jnp.broadcast_to(jnp.asarray(domain, U32), lo.shape), jnp.broadcast_to(jnp.asarray(aux, U32), lo.shape))
     h = tuple(jnp.broadcast_to(k, lo.shape) for k in key)
-    return F(o, h)
+    return (F_rolled if rolled else F)(o, h)
 
 
 def whiten(seed_lo, seed_hi):
