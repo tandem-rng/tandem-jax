@@ -33,10 +33,17 @@ or array, traced or not, and returns typed keys. `jax.random.split(key, n)` give
 position=0, width=None)` follow Appendix A of the specification, so every port returns the same
 values. `stream_normal(key, position, n, dtype)` and `stream_randint(key, position, n, minval,
 maxval, dtype, width=None)` return the draws and the position after them, which is aligned to
-the draw width plus `2 * ceil(n / 2)` draws for normals and `n` draws for bounded integers, and
-unchanged for `n = 0`. Normals are Box-Muller pairs: elements `2j` and `2j + 1` are
-`r cos 2 pi b` and `r sin 2 pi b` from uniform draws `2j` and `2j + 1`, computed in `float32` or
-`float64` as the dtype says, in one fused `jit`. Bounded integers use Lemire's method on draw `i`
+the draw width plus `n` draws for `float64` normals and bounded integers and `2 * ceil(n / 2)`
+draws for `float32` normals. For `n = 0` a `float64` normal fill aligns the position to 64 bits
+and the others leave it unchanged. `float64` normals are the 1024-layer ziggurat of Appendix A:
+element `i` from 64-bit draw `i` and the spec's tables, which `src/tandem_jax` holds as the
+spec's file `normal_f64_zig1024.json`. A draw that misses the inner rectangles, 0.43 % of them,
+continues on the fallback stream `split(g)` of `sub(0x4e524d3634)`, with `g` the index of the
+draw in the key's stream. XLA fuses a product into the sum that reads it, so the XLA path emulates
+the reference logarithm's fused multiply-adds exactly and keeps every other product out of a sum.
+`float32` normals are Box-Muller pairs: elements `2j` and `2j + 1` are `r cos 2 pi b` and
+`r sin 2 pi b` from uniform draws `2j` and `2j + 1`, computed in `float32` in one fused `jit`.
+Bounded integers use Lemire's method on draw `i`
 for element `i`. The draw width follows the range, 32 bits up to 2^32 and 64 bits above, so the
 dtype does not change the values, and `width` names it as the `u32` and `u64` fills of the C and
 CUDA ports do. A rejected draw retries on the fallback stream `split(g)` of `sub(0x424c573332)`
@@ -45,9 +52,9 @@ so a fill cut at any element boundary equals the whole fill. The retry loop runs
 draw was rejected. `maxval <= minval` gives `minval`. As in `jax.random.randint`, Python int
 bounds outside the dtype clip to it, and a `maxval` above it includes the largest value, so
 `randint(key, n, 0, 256, jnp.uint8)` gives every byte. `width=32` needs ranges of at most 2^32.
-Bounded integers and uniforms are exact
-across ports. Normals agree to the tolerance of Appendix A. Neither equals `jax.random.normal`
-or `jax.random.randint`.
+Bounded integers, uniforms and `float64` normals are exact
+across ports. `float32` normals agree to the tolerance of Appendix A. Neither equals
+`jax.random.normal` or `jax.random.randint`.
 
 `tj.sub(key, purpose)` is the purpose child for a purpose of up to 64 bits. `jax.random.fold_in`
 passes the implementation a 32-bit value, so it covers purposes below 2^32 only.
@@ -113,13 +120,13 @@ dtype but `bool`, `uniform`, `normal`, `randint` with scalar bounds, their `stre
 `jax.random.bits` then run on the tandem-c fills, at any chunk length. Fills of 256 KiB or more
 split into parts at stream row boundaries, one per thread of XLA's intra-op pool, and the call
 completes when the last part does. `jit` and `vmap` work: a batch writes its rows back to back.
-Stream draws, uniforms and bounded integers equal the XLA path bit for bit. Normals equal tandem-c
-bit for bit and the XLA path within the tolerance of Appendix A, since XLA's `log`, `sin` and `cos`
-are not tandem-c's polynomials.
+Stream draws, uniforms, bounded integers and `float64` normals equal the XLA path bit for bit.
+`float32` normals equal tandem-c bit for bit and the XLA path within the tolerance of Appendix A,
+since XLA's `log`, `sin` and `cos` are not tandem-c's polynomials.
 
-`cpu/tandem` holds `tandem.c` and `tandem.h` of tandem-c commit `86ea14e`, the last with
-Box-Muller `float64` normals. Its source is compiled with `-ffp-contract=off`, as tandem-c's
-Makefile does, which keeps the normals bit exact on every compiler.
+`cpu/tandem` holds `tandem.c`, `tandem.h` and `tandem_normal_tables.h` of tandem-c commit
+`121db59`, with the ziggurat `float64` normals. Its source is compiled with `-ffp-contract=off`,
+as tandem-c's Makefile does, which keeps the normals bit exact on every compiler.
 
 ### CUDA kernels
 
@@ -141,17 +148,23 @@ CPU device in the same program keeps the XLA path. The kernels write 32- and 64-
 directly. Narrower dtypes come from the 32-bit word fill and one XLA pass. They need a chunk
 length of 8 or more, and `randint` with per-element bounds keeps the XLA path. `jit` and `vmap`
 work: a batch of keys or positions runs as one kernel launch. The values are the XLA path's: bit
-for bit for the stream, uniforms and bounded integers, and within the tolerance of Appendix A for
-normals. The `float32` normals use the fast `__sincosf` of tandem-cuda, within 16 ulps + 1e-6.
+for bit for the stream, uniforms, bounded integers and `float64` normals, and within the tolerance
+of Appendix A for `float32` normals, which use the fast `__sincosf` of tandem-cuda, within 16 ulps
++ 1e-6. The `float64` normals take the ziggurat in one kernel that continues each miss where it
+finds it, as tandem-cuda's short fills do.
 
-The headers in `cuda/include` are those of tandem-cuda commit `b65745a`. Its fills give the
-same values as commit `5806e51`, the first with the global draw index in the bounded fallback.
+The headers in `cuda/include` are those of tandem-cuda commit `76eddae`, with the ziggurat
+`float64` normals of commit `0ff5f18`.
 
 ## Tests
 
 `tests/test_tandem.py` checks every vector of the specification (`tests/vectors.json`, a copy
 of the spec repository's file, with a drift check in CI), checks `normal` and `randint` against the C and CUDA fixtures in `tests/cross_derived.json` (written by `tools/convert_c_fixtures.py`, rejections included, fills from positions 0, 1 and 12345, from both C and CUDA), checks that a bounded fill cut at any element equals the whole fill and that `int32` and `int64` agree for a small range, checks `split`, `fork` and `sub` against fixed values from the C reference (`tests/cross_port.json`, written by `tools/gen_split_fixture.c`), checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps, compares positioned reads and
-`jax.random.bits` with reference stream dumps in `tests/data`,
+`jax.random.bits` with reference stream dumps in `tests/data`, checks the `float64` normals bit
+for bit against tandem-c's `tests/cross_normal.h` at commit `121db59` (SHA-256
+`3cd7c8f9178711255718288eb712eaccb33a1726d2a185f412f13590398ad3ac`, rows with wedge, redraw and
+tail misses) and tandem-cuda's `tests/cross_fill_normal.h` at `76eddae`, checks the ziggurat tables
+against the spec file's SHA-256,
 fork children at traced positions, split children for indices up to 2^64 - 1 against a direct evaluation of F,
 and runs the key implementation under `jit` and `vmap`. On a CUDA device with the extension, the
 whole suite runs on the kernels, and three more tests check that the kernels equal the XLA path
@@ -159,7 +172,8 @@ on the CPU device for every fill at odd, unaligned and 2^33-bit starts and over 
 blocks, that a `vmap` batch equals its rows, and that a GPU lowering calls the kernels. With the
 CPU extension, the whole suite runs on the tandem-c fills, and four more tests check that the
 fills equal the XLA path for every fill at odd and 2^33-bit starts, at chunk lengths 1 and 32 and
-at sizes that split over the thread pool, that the normals equal tandem-c's pairs bit for bit,
+at sizes that split over the thread pool, that the `float32` normals equal tandem-c's pairs bit
+for bit,
 that a `vmap` batch equals its rows, and that a CPU lowering calls the fills and does not without
 the extension. CI runs the suite on Linux and macOS with and without it.
 

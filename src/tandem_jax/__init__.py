@@ -10,6 +10,8 @@ float64, 23 for float32), so it does not equal the spec's Float64 and Float32 dr
 """
 
 import functools
+import importlib.resources
+import json
 import math
 
 import jax
@@ -288,10 +290,8 @@ PURPOSE_BELOW64 = 0x424C573634
 _RETRY_MAX = 64
 _BLOCK = 1024
 
-_TWO_PI = {  # 2 pi as a high and low part, so the reduced angle is good to the last bit
-    jnp.dtype("float64"): (6.283185307179586, 2.4492935982947064e-16),
-    jnp.dtype("float32"): (6.2831855, -1.7484555e-7),
-}
+# 2 pi as a high and low part, so the reduced angle of the float32 normals is good to the last bit.
+_TWO_PI_F32 = (6.2831855, -1.7484555e-7)
 
 
 def _default_float():
@@ -307,43 +307,224 @@ def _align(position, w):
 
 
 def stream_normal(k, position, n, dtype=None):
-    """`n` standard normals from stream bit `position` by Box-Muller, and the position after
-    them. Pair `j` is elements `2j` and `2j + 1`, `(r cos 2 pi b, r sin 2 pi b)` with
-    `r = sqrt(-2 log(1 - a))`, from uniform draws `2j` (`a`) and `2j + 1` (`b`). The fill
-    consumes `2 ceil(n / 2)` draws and an odd `n` drops the last sin half. float32 is computed
-    in float32. `n = 0` leaves the position unchanged."""
+    """`n` standard normals from stream bit `position`, and the position after them.
+
+    float64: the 1024-layer ziggurat of Appendix A, element `i` from 64-bit draw `i`, `n` draws
+    in all. A draw that misses the inner rectangles continues on its own fallback stream, keyed
+    by its index in the key's stream. `n = 0` aligns the position to 64 bits.
+
+    float32: Box-Muller in float32. Pair `j` is elements `2j` and `2j + 1`,
+    `(r cos 2 pi b, r sin 2 pi b)` with `r = sqrt(-2 log(1 - a))`, from uniform draws `2j` (`a`)
+    and `2j + 1` (`b`). The fill consumes `2 ceil(n / 2)` draws and an odd `n` drops the last sin
+    half. `n = 0` leaves the position unchanged."""
     dtype = jnp.dtype(dtype if dtype is not None else _default_float())
-    if dtype not in _TWO_PI:
+    if dtype not in (jnp.dtype("float32"), jnp.dtype("float64")):
         raise TypeError(f"normal needs float32 or float64, got {dtype}")
+    position = _position(position)
     if n == 0:
-        return jnp.zeros(0, dtype), _position(position)
-    return _normal(key_data(k), _position(position), n, dtype, _chunk_length(k))
+        return jnp.zeros(0, dtype), _align(position, 64) if dtype.itemsize == 8 else position
+    return _normal(key_data(k), position, n, dtype, _chunk_length(k))
 
 
 @functools.partial(jax.jit, static_argnames=("n", "dtype", "chunk"))
 def _normal(key, position, n, dtype, chunk):
-    draws = 2 * ((n + 1) // 2)
-    pos = _align(position, 8 * dtype.itemsize) + 8 * dtype.itemsize * draws
     call = lambda: _ffi.fill(key, position, n, dtype, chunk, "normal")
-    return _ffi.native(True, True, call, lambda: _box_muller(key, position, draws, dtype, chunk)[:n]), pos
+    if dtype.itemsize == 8:
+        pos = _align(position, 64) + 64 * n
+        return _ffi.native(True, True, call, lambda: _ziggurat(key, position, n, chunk)), pos
+    draws = 2 * ((n + 1) // 2)
+    pos = _align(position, 32) + 32 * draws
+    return _ffi.native(True, True, call, lambda: _box_muller(key, position, draws, chunk)[:n]), pos
 
 
-def _box_muller(key, position, draws, dtype, chunk):
+def _box_muller(key, position, draws, chunk):
     # Traced under _normal's jit, so the uniforms, log, sqrt, sin and cos fuse into one pass.
-    u, _ = stream(key, position, draws, dtype, chunk)
+    u, _ = stream(key, position, draws, jnp.float32, chunk)
     a, b = u[0::2], u[1::2]
     r = jnp.sqrt(-2 * jnp.log(1 - a))
     # Reduce to a quadrant and an angle in [-1/8, 1/8] of a turn first: b - q / 4 is exact, so
     # no precision is lost to the large angle.
     q = (b * 4 + 0.5).astype(jnp.int32)
-    f = b - q.astype(dtype) * 0.25
-    hi, lo = _TWO_PI[dtype]
-    th = f * dtype.type(hi) + f * dtype.type(lo)
+    f = b - q.astype(jnp.float32) * 0.25
+    hi, lo = _TWO_PI_F32
+    th = f * jnp.float32(hi) + f * jnp.float32(lo)
     c0, s0 = jnp.cos(th), jnp.sin(th)
     q = q & 3
     c = jnp.where(q == 0, c0, jnp.where(q == 1, -s0, jnp.where(q == 2, -c0, s0)))
     s = jnp.where(q == 0, s0, jnp.where(q == 1, c0, jnp.where(q == 2, -s0, -c0)))
     return jnp.stack([r * c, r * s], axis=-1).reshape(-1)
+
+
+# The float64 ziggurat of Appendix A. Its values are exact across ports only when every operation
+# rounds as the spec says, so the reference logarithm's fused multiply-adds are emulated exactly
+# and no other product may fuse into a sum.
+
+PURPOSE_NORMAL64 = 0x4E524D3634
+_LN2_HI, _LN2_LO = 1.3862943607382476, 3.816429394731813e-10  # 2 ln 2 split, nk * hi is exact
+_LOG_C = (0.08312363319426472, 0.09070001083303751, 0.11111433317907482, 0.14285712049336274,
+          0.2000000000566491, 0.33333333333331017)  # c6 down to c1
+
+
+@functools.cache
+def _zig_tables():
+    """W for a clear sign bit at i and -W at 1024 + i, so the low 11 bits of a draw index it, then
+    K, Y and R, from the spec's tables/normal_f64_zig1024.json."""
+    d = json.loads(importlib.resources.files(__package__).joinpath("normal_f64_zig1024.json").read_text())
+    w = np.array([float.fromhex(v) for v in d["W"]])
+    y = np.array([float.fromhex(v) for v in d["Y"]])
+    return np.concatenate([w, -w]), np.array(d["K"], np.uint64), y, float.fromhex(d["R"])
+
+
+def _alone(p):
+    """The product `p` rounded on its own. XLA's CPU backend fuses a product into the sum that
+    reads it, which rounds once where the spec rounds twice. A select hides the product from
+    that fusion, and no product here is NaN."""
+    return jnp.where(jnp.isnan(p), 0.0, p)
+
+
+def _opaque(c, like):
+    """The constant `c` as a value XLA cannot see, since its simplifier rewrites the error-free
+    sums below when one operand is a literal. `like` is never NaN."""
+    return jnp.where(jnp.isnan(like), 0.0, c)
+
+
+def _two_sum(a, b):
+    s = a + b
+    t = s - a
+    return s, (a - (s - t)) + (b - t)
+
+
+def _halves(a):
+    """`a` as a 26-bit high part, rounded on the bits, and the exact rest of at most 26 bits."""
+    bits = lax.bitcast_convert_type(a, jnp.uint64)
+    hi = lax.bitcast_convert_type((bits + jnp.uint64(1 << 26)) & ~jnp.uint64((1 << 27) - 1), jnp.float64)
+    return hi, a - hi
+
+
+def _two_prod(a, b):
+    """Dekker's product: `p + e == a * b` exactly. The partial products are exact, so a fused
+    multiply-add over them gives the same bits."""
+    a, b = jnp.asarray(a, jnp.float64), jnp.asarray(b, jnp.float64)
+    p = _alone(a * b)
+    ah, al = _halves(a)
+    bh, bl = _halves(b)
+    return p, ((ah * bh - p) + ah * bl + al * bh) + al * bl
+
+
+def _fma(a, b, c):
+    """`a * b + c` rounded once, by Boldo and Melquiond's emulation with a sum rounded to odd
+    (IEEE Trans. Computers 57, 2008). It needs no underflow, which the logarithm's operands avoid."""
+    b, c = _opaque(b, a), _opaque(c, a)
+    uh, ul = _two_prod(a, b)
+    th, tl = _two_sum(c, uh)
+    s, e = _two_sum(tl, ul)
+    bits = lax.bitcast_convert_type(s, jnp.uint64)
+    # Round to odd: an inexact sum with an even last bit moves one ulp toward the exact one.
+    step = jnp.where((e > 0) == (s > 0), jnp.uint64(1), jnp.uint64(2**64 - 1))
+    bits = jnp.where((e != 0) & ((bits & jnp.uint64(1)) == 0), bits + step, bits)
+    return th + lax.bitcast_convert_type(bits, jnp.float64)
+
+
+def _neg2_log(x):
+    """The spec's reference logarithm, -2 ln x for float64 x in (0, 1]."""
+    u64 = jnp.uint64
+    ix = lax.bitcast_convert_type(x, u64) + u64(0x00095F6200000000)
+    nk = (1023 - (ix >> u64(52)).astype(jnp.int64)).astype(jnp.float64)
+    m = lax.bitcast_convert_type((ix & u64(0x000FFFFFFFFFFFFF)) + u64(0x3FE6A09E00000000), jnp.float64)
+    s = (m - 1.0) / (m + 1.0)
+    z = _alone(s * s)
+    p = _LOG_C[0]
+    for c in _LOG_C[1:] + (1.0,):
+        p = _fma(z, p, c)
+    return _fma(nk, _LN2_LO, _fma(nk, _LN2_HI, _alone((s * -4.0) * p)))
+
+
+def _zig_fast(r):
+    """The fast path of a 64-bit draw `r`: its value and whether it missed the inner rectangles."""
+    W, K, _, _ = _zig_tables()
+    i = (r & jnp.uint64(2047)).astype(jnp.int32)
+    ra = r >> jnp.uint64(11)
+    return ra.astype(jnp.float64) * jnp.asarray(W)[i], ra >= jnp.asarray(K)[i & 1023]
+
+
+_WEDGE, _REDRAW, _TAIL_A, _TAIL_B = range(4)
+_ZIG_SHARE = 64
+"""The slow path takes up to one element in this many, 3.6 times the expected misses."""
+
+
+def _zig_slow(key, g, r, pending, K):
+    """The misses with draws `r` at global draw indices `g`, each on its fallback stream split(g)
+    of sub(PURPOSE_NORMAL64). Every pending element takes one fallback draw a round, as the
+    phase it is in needs: a wedge test, a fresh draw, or one of the two tail draws."""
+    _, _, Y, R = _zig_tables()
+    Y = jnp.asarray(Y)
+    lo, hi = U32(PURPOSE_NORMAL64 & 0xFFFFFFFF), U32(PURPOSE_NORMAL64 >> 32)
+    o, _ = F_keyed(key, (lo, hi), DOMAIN_FOLD, 0)
+    child = _split_words(o, g)
+    child = tuple(child[..., w] for w in range(4))
+    x, _ = _zig_fast(r)
+    layer = lambda r: (r & jnp.uint64(1023)).astype(jnp.int32)
+    phase = jnp.where(layer(r) == 0, _TAIL_A, _WEDGE)
+    zero = jnp.zeros(g.shape)
+
+    def body(st):
+        d, phase, r, x, a, out, pend = st
+        v = _fallback_draw(child, d, 64, K)
+        u = (v >> jnp.uint64(11)).astype(jnp.float64) * 2.0**-53
+        i = layer(r)
+        R_ = _opaque(R, u)
+        y = Y[i] + _alone(u * (Y[i + 1] - Y[i]))
+        lg = 0.5 * _neg2_log(jnp.where(phase == _WEDGE, y, 1.0 - u))  # -ln
+        x2, miss2 = _zig_fast(v)
+        tail = jnp.where((r >> jnp.uint64(10)) & jnp.uint64(1) == 1, -(R_ + a), R_ + a)
+        done = jnp.select(
+            [phase == _WEDGE, phase == _REDRAW, phase == _TAIL_B],
+            [-lg < -0.5 * (x * x), ~miss2, lg + lg >= a * a],
+            False,
+        )
+        val = jnp.select([phase == _WEDGE, phase == _REDRAW], [x, x2], tail)
+        after = jnp.select(
+            [phase == _WEDGE, phase == _REDRAW, phase == _TAIL_A],
+            [_REDRAW, jnp.where(layer(v) == 0, _TAIL_A, _WEDGE), _TAIL_B],
+            _TAIL_A,
+        )
+        redraw = pend & (phase == _REDRAW)
+        return (
+            d + U32(1),
+            jnp.where(pend, after, phase),
+            jnp.where(redraw, v, r),
+            jnp.where(redraw, x2, x),
+            jnp.where(pend & (phase == _TAIL_A), lg / R_, a),
+            jnp.where(pend & done, val, out),
+            pend & ~done,
+        )
+
+    init = (U32(0), phase, r, x, zero, zero, pending)
+    return lax.while_loop(lambda st: st[-1].any(), body, init)[5]
+
+
+def _ziggurat(key, position, n, chunk):
+    r, pos = stream(key, position, n, jnp.uint64, chunk)
+    x, miss = _zig_fast(r)
+    g0 = pos // jnp.uint64(64) - jnp.uint64(n)
+    key = tuple(key)
+    # 0.43 % of the draws miss. Gathering them takes one pass, and the slow path then runs on a
+    # few times the expected count, or on every element when more miss than that.
+    cap = min(n, max(_RETRY_MAX, n // _ZIG_SHARE))
+    count = miss.sum()
+
+    def few(_):
+        idx = jnp.nonzero(miss, size=cap, fill_value=0)[0]
+        active = jnp.arange(cap) < count
+        fixed = _zig_slow(key, g0 + idx.astype(jnp.uint64), r[idx], active, chunk)
+        return x.at[jnp.where(active, idx, n)].set(fixed, mode="drop")
+
+    def many(_):
+        fixed = _zig_slow(key, g0 + jnp.arange(n, dtype=jnp.uint64), r, miss, chunk)
+        return jnp.where(miss, fixed, x)
+
+    branches = [lambda _: x, few] + ([many] if n > cap else [])
+    return lax.switch((count > 0).astype(jnp.int32) + (count > cap).astype(jnp.int32), branches, None)
 
 
 def normal(k, shape=(), dtype=None, position=0):

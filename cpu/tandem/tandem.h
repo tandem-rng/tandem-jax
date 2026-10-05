@@ -71,17 +71,19 @@ void tandem_next_c64(tandem_rng *rng, double out[2]);
 uint32_t tandem_u32_below(tandem_rng *rng, uint32_t n);
 uint64_t tandem_u64_below(tandem_rng *rng, uint64_t n);
 
-/* Standard normals by Box-Muller from two uniforms a and b: r = sqrt(-2 ln(1 - a)) and the pair
- * (r cos 2 pi b, r sin 2 pi b). They match Rng::normal, normalf and the pair forms of
- * tandem-cuda and are not part of the specification. tandem_normal_* returns the cos half and
- * consumes two uniforms, tandem_normal2_* returns both halves from the same two uniforms, cos
- * first. The f32 versions draw f32 uniforms, 64 bits, and compute in float. Float libm functions
- * differ between platforms, so f32 normals agree across ports to a few ulps, not bit for bit.
- * Link with -lm. */
-void tandem_normal2_f64(tandem_rng *rng, double out[2]);
-void tandem_normal2_f32(tandem_rng *rng, float out[2]);
+/* Standard normals, Appendix A of the specification. Link with -lm.
+ *
+ * f64: a 1024-layer ziggurat on one 64-bit draw. A draw outside the inner rectangles, 0.43 % of
+ * them, continues on a fallback stream keyed by its global draw index, which never moves this
+ * generator. The values are bit exact on every compiler and target and across ports.
+ *
+ * f32: Box-Muller from two f32 uniforms a and b, r = sqrt(-2 ln(1 - a)) and the pair
+ * (r cos 2 pi b, r sin 2 pi b), computed in float. tandem_normal_f32 returns the cos half and
+ * consumes both uniforms, tandem_normal2_f32 returns both halves, cos first. They match
+ * Rng::normalf of tandem-cuda bit for bit and other ports to a few ulps. */
 double tandem_normal_f64(tandem_rng *rng);
 float tandem_normal_f32(tandem_rng *rng);
+void tandem_normal2_f32(tandem_rng *rng, float out[2]);
 
 /* Fills: n aligned elements, the same values as n scalar draws. */
 void tandem_fill_bool(tandem_rng *rng, bool *out, size_t n);
@@ -106,9 +108,10 @@ void tandem_fill_c64(tandem_rng *rng, double *out, size_t n);
 void tandem_fill_u32_below(tandem_rng *rng, uint32_t *out, size_t len, uint32_t n);
 void tandem_fill_u64_below(tandem_rng *rng, uint64_t *out, size_t len, uint64_t n);
 
-/* n normals as the flattened sequence of tandem_normal2 pairs: pair j is elements 2j and 2j + 1
- * from uniforms 2j and 2j + 1. An odd n keeps the cos half of its last pair and still consumes
- * both uniforms, 2 * ceil(n / 2) in all. */
+/* f64: element i from draw i of tandem_fill_u64, n draws in all, so a fill equals n scalar draws
+ * and a fill cut anywhere equals the whole fill. An empty fill aligns the position to 64.
+ * f32: the flattened tandem_normal2_f32 pairs, pair j from uniforms 2j and 2j + 1. An odd n keeps
+ * the cos half of its last pair and still consumes both uniforms, 2 * ceil(n / 2) in all. */
 void tandem_fill_normal_f64(tandem_rng *rng, double *out, size_t n);
 void tandem_fill_normal_f32(tandem_rng *rng, float *out, size_t n);
 

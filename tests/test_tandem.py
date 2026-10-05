@@ -1,5 +1,6 @@
 """Spec vectors, Julia stream dumps, and the registered key implementation."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -350,34 +351,65 @@ def close(got, want, dtype, ulps32=8):
     assert (np.abs(got - want) <= tol).all(), np.abs(got - want).max()
 
 
-def test_normal_pairs_match_c_reference():
+def test_zig_tables_are_the_spec_file():
+    path = Path(tj.__file__).with_name("normal_f64_zig1024.json")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == "8b961dd46a2582b953bd8780138edb0ad712e3d243a366a123ffc8978d0a33ab"
+
+
+def test_normal64_equals_the_c_reference_bit_for_bit():
+    # tandem-c's tests/cross_normal.h: the last rows hold misses of every kind, wedge accepted,
+    # wedge rejected and tail, and starts 0 and 1 share draws at different element indices.
     k = tj.key(42)
-    for dtype, name, end in ((jnp.float64, "pairs64", "pairs64_end_pos"), (jnp.float32, "pairs32", "pairs32_end_pos")):
-        z, pos = tj.stream_normal(k, 1, len(D[name]), dtype)
-        assert z.dtype == np.dtype(dtype) and int(pos) == D[end]
-        close(z, D[name], np.dtype(dtype).type)
+    for c in D["normal64"]:
+        z, pos = tj.stream_normal(k, c["start"], len(c["out"]), jnp.float64)
+        assert np.array_equal(np.array(z), np.array(c["out"])) and int(pos) == c["end_pos"], c["start"]
+
+
+def test_normal64_slow_path_over_every_element(monkeypatch):
+    # More misses than the gathered set holds send every element through the slow path, which
+    # must give the values of the gathered one.
+    monkeypatch.setattr(tj._ffi, "tandem_jax_cpu", None)
+    monkeypatch.setattr(tj._ffi, "tandem_jax_cuda", None)
+    jax.clear_caches()
+    f = lambda: np.array(tj.stream_normal(tj.key(42), 12345, 4096, jnp.float64)[0])
+    few = f()
+    monkeypatch.setattr(tj, "_RETRY_MAX", 1)
+    monkeypatch.setattr(tj, "_ZIG_SHARE", 2**62)
+    jax.clear_caches()
+    try:
+        assert np.array_equal(f(), few)
+    finally:
+        monkeypatch.undo()
+        jax.clear_caches()
+
+
+def test_normal32_pairs_match_c_reference():
+    z, pos = tj.stream_normal(tj.key(42), 1, len(D["pairs32"]), jnp.float32)
+    assert z.dtype == np.float32 and int(pos) == D["pairs32_end_pos"]
+    close(z, D["pairs32"], np.float32)
 
 
 def test_normal_fills_match_cuda_fixtures():
     k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)
-    for name, dtype, w in (("device_normal64", jnp.float64, 64), ("device_normal32", jnp.float32, 32)):
-        for c in D[name]:
-            z, pos = tj.stream_normal(k, c["pos"], c["n"], dtype)
-            close(z, c["out"], np.dtype(dtype).type)
-            start = (c["pos"] + w - 1) // w * w
-            assert int(pos) == start + w * 2 * ((c["n"] + 1) // 2)
-            assert np.array_equal(np.array(tj.normal(k, c["n"], dtype, c["pos"])), np.array(z))
+    for c in D["device_normal64"]:
+        z, pos = tj.stream_normal(k, c["pos"], c["n"], jnp.float64)
+        assert np.array_equal(np.array(z), np.array(c["out"])) and int(pos) == (c["pos"] + 63) // 64 * 64 + 64 * c["n"]
+    for c in D["device_normal32"]:
+        z, pos = tj.stream_normal(k, c["pos"], c["n"], jnp.float32)
+        close(z, c["out"], np.float32)
+        assert int(pos) == (c["pos"] + 31) // 32 * 32 + 32 * 2 * ((c["n"] + 1) // 2)
+        assert np.array_equal(np.array(tj.normal(k, c["n"], jnp.float32, c["pos"])), np.array(z))
 
 
 def test_normal_edge_cases():
     k = tj.key(42)
     z, pos = tj.stream_normal(k, 5, 0, jnp.float64)
+    assert z.shape == (0,) and int(pos) == 64
+    z, pos = tj.stream_normal(k, 5, 0, jnp.float32)
     assert z.shape == (0,) and int(pos) == 5
-    odd, pos_odd = tj.stream_normal(k, 0, 5, jnp.float64)
-    even, pos_even = tj.stream_normal(k, 0, 6, jnp.float64)
-    assert np.array_equal(np.array(odd), np.array(even[:5])) and int(pos_odd) == int(pos_even) == 6 * 64
-    big = tj.normal(k, (200_000,), jnp.float64)
-    assert abs(float(big.mean())) < 0.01 and abs(float(big.std()) - 1) < 0.01
+    odd, pos_odd = tj.stream_normal(k, 0, 5, jnp.float32)
+    even, pos_even = tj.stream_normal(k, 0, 6, jnp.float32)
+    assert np.array_equal(np.array(odd), np.array(even[:5])) and int(pos_odd) == int(pos_even) == 6 * 32
     f = jax.jit(lambda k, p: tj.stream_normal(k, p, 100, jnp.float32)[0])
     # Fusion may change the last bit of a float32 sin or cos.
     close(f(k, jnp.uint64(640)), np.array(tj.stream_normal(k, 640, 100, jnp.float32)[0]), np.float32, ulps32=2)
@@ -611,8 +643,8 @@ def test_cuda_kernels_equal_the_xla_path(K):
             g = lambda kd, p: f(kd, p, n)
             for p in (0, 1, 12345, 2**33 + 7):
                 got, want = _run_on(gpu, g, kd, jnp.uint64(p)), _run_on(cpu, g, kd, jnp.uint64(p))
-                if f in normals:
-                    close(got, want, want.dtype.type, ulps32=16)
+                if f is normals[0]:
+                    close(got, want, np.float32, ulps32=16)
                 else:
                     assert np.array_equal(got, want), (i, n, p)
 
@@ -675,38 +707,39 @@ def test_cpu_fills_equal_the_xla_path(K, monkeypatch):
     run = lambda: [_run_on(cpu, lambda kd, p: f(kd, p, n), kd, jnp.uint64(p)) for f, n, p in cases]
     got, want = run(), _without_cpu_extension(monkeypatch, run)
     for (f, n, p), g, w in zip(cases, got, want):
-        if f in normals:
-            close(g, w, w.dtype.type)
+        if f is normals[0]:
+            close(g, w, np.float32)
         else:
             assert np.array_equal(g, w), (cases.index((f, n, p)), n, p)
 
 
 @cpu_only
-def test_cpu_normals_equal_the_c_fixtures_bit_for_bit():
-    k = tj.key(42)
-    for dtype, name in ((jnp.float64, "pairs64"), (jnp.float32, "pairs32")):
-        z, _ = tj.stream_normal(k, 1, len(D[name]), dtype)
-        assert np.array_equal(np.array(z), np.array(D[name], dtype)), name
+def test_cpu_normal32_equals_the_c_reference_bit_for_bit():
+    with jax.default_device(jax.devices("cpu")[0]):
+        z, _ = tj.stream_normal(tj.key(42), 1, len(D["pairs32"]), jnp.float32)
+    assert np.array_equal(np.array(z), np.array(D["pairs32"], np.float32))
 
 
 @cpu_only
 def test_cpu_fills_batch_under_vmap():
-    keys = jax.random.split(tj.key(5), 3)
-    pos = jnp.array([0, 33, 2**33 + 1], jnp.uint64)
-    for f in (
-        lambda k, p: tj.stream(k, p, 300001, jnp.float32)[0],
-        lambda k, p: tj.stream(k, p, 1001, jnp.uint8)[0],
-        lambda k, p: tj.stream_normal(k, p, 1001, jnp.float64)[0],
-        lambda k, p: tj.stream_randint(k, p, 1001, -3, 2**31 + 1, jnp.int64)[0],
-    ):
-        batched = np.array(jax.jit(jax.vmap(f))(keys, pos))
-        for i in range(3):
-            assert np.array_equal(batched[i], np.array(f(keys[i], pos[i])))
+    with jax.default_device(jax.devices("cpu")[0]):
+        keys = jax.random.split(tj.key(5), 3)
+        pos = jnp.array([0, 33, 2**33 + 1], jnp.uint64)
+        for f in (
+            lambda k, p: tj.stream(k, p, 300001, jnp.float32)[0],
+            lambda k, p: tj.stream(k, p, 1001, jnp.uint8)[0],
+            lambda k, p: tj.stream_normal(k, p, 1001, jnp.float64)[0],
+            lambda k, p: tj.stream_randint(k, p, 1001, -3, 2**31 + 1, jnp.int64)[0],
+        ):
+            batched = np.array(jax.jit(jax.vmap(f))(keys, pos))
+            for i in range(3):
+                assert np.array_equal(batched[i], np.array(f(keys[i], pos[i])))
 
 
 @cpu_only
 def test_cpu_lowers_to_the_fills(monkeypatch):
-    k = tj.key(1)
-    f = lambda: jax.jit(lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))).lower().compile().as_text()
-    assert f().count('custom_call_target="tandem_fill"') == 4
-    assert "tandem_fill" not in _without_cpu_extension(monkeypatch, f)
+    with jax.default_device(jax.devices("cpu")[0]):
+        k = tj.key(1)
+        f = lambda: jax.jit(lambda: (tj.uniform(k, 10), tj.normal(k, 10), tj.randint(k, 10, 0, 9), jax.random.bits(k, (10,), jnp.uint32))).lower().compile().as_text()
+        assert f().count('custom_call_target="tandem_fill"') == 4
+        assert "tandem_fill" not in _without_cpu_extension(monkeypatch, f)

@@ -25,7 +25,7 @@ pip install scikit-build-core
 pip install --no-build-isolation ./cpu
 ```
 
-`cpu/tandem` is tandem-c commit `86ea14e`.
+`cpu/tandem` is tandem-c commit `121db59`.
 
 For NVIDIA GPUs, build the XLA FFI extension in `cuda/`. It needs `nvcc` matching your
 `jax[cuda]` major version, and CMake 3.24 or later.
@@ -36,7 +36,7 @@ pip install --no-build-isolation ./cuda
 # one architecture only: -C cmake.define.CMAKE_CUDA_ARCHITECTURES=80
 ```
 
-The headers in `cuda/include` are tandem-cuda commit `b65745a`.
+The headers in `cuda/include` are tandem-cuda commit `76eddae`.
 
 ## Use
 
@@ -69,7 +69,8 @@ kids, pos = tj.fork(key, pos, 4)                   # the spec's fork, typed keys
   `float16`, `float32`, `float64`, `complex64`, `complex128`, and the position after.
 - `tj.uniform(key, shape, dtype, position=0)`: the spec's mapping, unlike `jax.random.uniform`.
 - `tj.randint`, `tj.stream_randint`: bounded integers, same values in every port.
-- `tj.normal`, `tj.stream_normal`: Box-Muller normals, same to the tolerance of Appendix A.
+- `tj.normal`, `tj.stream_normal`: the ziggurat for `float64`, bit exact in every port, and
+  Box-Muller for `float32`, same to the tolerance of Appendix A.
 - Neither `tj.normal` nor `tj.randint` equals the `jax.random` function of that name.
 - CPU: with `cpu/` installed, `stream`, `uniform`, `normal`, `randint`, and `jax.random` on a
   Tandem key run on the tandem-c fills over XLA's thread pool, under `jit` and `vmap`.

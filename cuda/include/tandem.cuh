@@ -6,9 +6,11 @@
  *
  *   - tandem::fill_u32/u64/f32/f64: fill device memory from a key and stream position. One
  *     thread per chunk, blocks stored lane-interleaved so a warp writes whole 128-byte lines.
- *   - tandem::fill_u32_below/u64_below, fill_normal_f64/f32: bounded integers and normals, which
- *     are not part of the specification. A bounded element consumes one draw and a rejected draw
- *     retries on a fallback stream, a normal is Box-Muller of two Float64 draws of the fill.
+ *   - tandem::fill_u32_below/u64_below, fill_normal_f64/f32, fill_exponential_f64/f32: bounded
+ *     integers, normals and exponentials, which are not part of the specification. A bounded
+ *     element consumes one draw and a rejected draw retries on a fallback stream, an f64 normal
+ *     is the ziggurat of one draw, an f32 normal is Box-Muller of two draws of the fill, and an
+ *     exponential is -ln(1 - u) of one draw.
  *     See the README for the stream contract.
  *   - tandem::generator: key, position and K on the host, whose fill_* calls advance the
  *     position.
@@ -74,6 +76,8 @@ namespace detail {
 /* Kinds that share an output type with another kind. */
 struct bool_bits {}; /* one stream bit per bool, stored as a byte */
 struct f16_bits {};  /* binary16 bit patterns, stored as uint16_t */
+struct exp_f32 {};   /* exponentials of the Float32 draws, stored as float */
+struct exp_f64 {};   /* exponentials of the Float64 draws, stored as double */
 /* Lemire bounded draws over the u32 (u64) fill, see PURPOSE_BELOW32, stored as O after adding
  * a low bound. O may be wider than the draw. */
 template <class O> struct below32 {};
@@ -118,6 +122,20 @@ template <> struct elem<double> {
     static constexpr unsigned bits = 64;
     __device__ static out_t make(const uint32_t w[4], unsigned i, uint64_t, const Ctx &) {
         return to_f64(w[2 * i] | ((uint64_t)w[2 * i + 1] << 32));
+    }
+};
+template <> struct elem<exp_f32> {
+    using out_t = float;
+    static constexpr unsigned bits = 32;
+    __device__ static out_t make(const uint32_t w[4], unsigned i, uint64_t, const Ctx &) {
+        return exponential_f32(to_f32(w[i]));
+    }
+};
+template <> struct elem<exp_f64> {
+    using out_t = double;
+    static constexpr unsigned bits = 64;
+    __device__ static out_t make(const uint32_t w[4], unsigned i, uint64_t, const Ctx &) {
+        return exponential_f64(to_f64(w[2 * i] | ((uint64_t)w[2 * i + 1] << 32)));
     }
 };
 template <> struct elem<uint16_t> {
@@ -170,6 +188,8 @@ template <class E> struct vec4 { using type = uint4; };
 template <> struct vec4<float> { using type = float4; };
 template <> struct vec4<uint64_t> { using type = ulonglong2; };
 template <> struct vec4<double> { using type = double2; };
+template <> struct vec4<exp_f32> { using type = float4; };
+template <> struct vec4<exp_f64> { using type = double2; };
 
 /* Store the elements of one block that fall inside the output. `first` is the byte offset
  * of the block in the stream, `b0` and `b1` bound the output's bytes. With ALIGNED the
@@ -186,15 +206,18 @@ __device__ __forceinline__ void store_block(typename elem<E>::out_t *out, uint64
      * anywhere equals the whole fill. `first` is a byte of the stream, a multiple of size. */
     for (unsigned i = 0; i < per_block; i++) v[i] = elem<E>::make(w, i, first / size + i, x);
     if constexpr (sizeof(out_t) != size) {
-        /* The output element is wider than its draw. A block inside the output goes out as
-         * 16-byte stores when its first element is 16-byte aligned, element stores otherwise. */
-        if (first >= b0 && first + 16 <= b1) {
-            out_t *dst = out + (first - b0) / size;
-            if ((reinterpret_cast<uintptr_t>(dst) & 15u) == 0) {
-                constexpr unsigned vecs = per_block * sizeof(out_t) / 16;
-                for (unsigned k = 0; k < vecs; k++)
-                    reinterpret_cast<uint4 *>(dst)[k] = reinterpret_cast<const uint4 *>(v)[k];
-                return;
+        /* The output element is wider or narrower than its draw. A block inside a wider output
+         * goes out as 16-byte stores when its first element is 16-byte aligned. A narrower one
+         * fills less than 16 bytes, so it takes element stores like a block at an edge. */
+        if constexpr (sizeof(out_t) > size) {
+            if (first >= b0 && first + 16 <= b1) {
+                out_t *dst = out + (first - b0) / size;
+                if ((reinterpret_cast<uintptr_t>(dst) & 15u) == 0) {
+                    constexpr unsigned vecs = per_block * sizeof(out_t) / 16;
+                    for (unsigned k = 0; k < vecs; k++)
+                        reinterpret_cast<uint4 *>(dst)[k] = reinterpret_cast<const uint4 *>(v)[k];
+                    return;
+                }
             }
         }
         for (unsigned i = 0; i < per_block; i++) {
@@ -367,69 +390,261 @@ __global__ void __launch_bounds__(THREADS)
     }
 }
 
-/* Normal fill. Pair j, the elements 2j (cos half) and 2j + 1 (sin half), is one Box-Muller step
- * of the Float64 draws 2j and 2j + 1 of the fill, so the first draw of the fill sits at the
- * position aligned to 64 bits. With that position at an even draw, both draws of a pair are
- * the halves of one block. At an odd draw (ODD) they
- * are the high half of one block and the low half of the next, so each thread also steps the
- * chunk that holds its predecessor block: chunk c - 1, or for lane 0 the last lane of the
- * previous row, which is chunk 8g + 7 one step behind or, at step 0, the previous group's. Block
- * `ba` is the first block that yields a pair, `bb` the last. One pair per block. */
-template <class O, bool ODD>
+/* Float64 normal fill, two kernels. The table pass runs one thread per chunk as the direct
+ * kernel does: element e takes UInt64 draw d0 + e and the ziggurat's fast path. A miss, 0.43 % of
+ * the elements, goes to a queue in shared memory, and the block appends its queue to a list in
+ * global memory with one atomic add, or a miss goes to the list directly when the queue is full.
+ * The second kernel continues each listed miss on its fallback stream, one thread per miss, so the
+ * table pass makes no calls and keeps its registers. When the list overflows, the second kernel
+ * walks the whole fill again and continues every miss. The tables live in global memory: copies
+ * in shared memory gained nothing on the A100.
+ *
+ * A block's two elements land on a 16-byte slot when the output and the stream agree modulo 16
+ * bytes, as for a start at an even draw. Otherwise (SHIFT), for an odd draw, each thread stores
+ * one step late the high element of its block with the low element of lane l + 1's, or of lane 0's
+ * next block for lane 7, which a warp shuffle brings. A group's 128 bytes then cover whole sectors:
+ * a row 8 bytes off them halved the speed of the A100, even with 16-byte stores. */
+struct NormalMiss {
+    uint64_t e, r; /* element index, draw */
+};
+
+constexpr unsigned NORMAL_QUEUE = 256; /* per block, about four times the mean of 70 misses */
+
+/* The blocks of a fill from draw d0 to d1 - 1: block beta holds draws 2 beta and 2 beta + 1, and
+ * chunk c steps through blocks beta0 + 8 j. Steps jf to jl hold blocks of the fill, and only
+ * blocks ba and bb can be partial, so range checks are needed at jf and jl alone. */
+struct NormalSpan {
+    uint64_t d0, d1, ba, bb, beta0;
+    int jf, jl;
+
+    __device__ NormalSpan(uint64_t c, uint32_t K, uint64_t d0_, uint64_t n)
+        : d0(d0_), d1(d0_ + n), ba(d0_ >> 1), bb((d0_ + n - 1u) >> 1) {
+        beta0 = (c >> 3) * K * 8u + (c & 7u);
+        jf = beta0 >= ba ? 0 : (int)((ba - beta0 + 7u) >> 3);
+        jl = beta0 > bb ? -1 : (int)((bb - beta0) >> 3 < K - 1u ? (bb - beta0) >> 3 : K - 1u);
+    }
+    __device__ bool in(uint64_t d) const { return d >= d0 && d < d1; }
+
+    /* body(d, r0, r1, edge) for the draws d and d + 1 of each block of chunk c in the fill. */
+    template <class F> __device__ void walk(const uint32_t key[4], uint64_t c, F &&body) const {
+        if (jl < jf) return;
+        uint32_t o[4], h[4];
+        F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
+        uint64_t d = 2u * beta0;
+        for (int j = 0; j <= jl; j++, d += 16u) {
+            T(o, h);
+            if (j >= jf)
+                body(d, o[0] | ((uint64_t)o[1] << 32), o[2] | ((uint64_t)o[3] << 32),
+                     j == jf || j == jl);
+        }
+    }
+};
+
+template <bool SHIFT>
 __global__ void __launch_bounds__(THREADS)
-    fill_normal_kernel(uint32_t key0, uint32_t key1, uint32_t key2, uint32_t key3, uint32_t K,
-                       uint64_t g0, uint64_t ba, uint64_t bb, uint64_t n, O *out) {
-    uint64_t c = 8u * g0 + blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
-    uint64_t g = c >> 3, lane = c & 7u;
-    if (g * K * 8u > bb) return;
-    const bool vec = (reinterpret_cast<uintptr_t>(out) & 15u) == 0;
+    fill_normal64_kernel(uint32_t key0, uint32_t key1, uint32_t key2, uint32_t key3, uint32_t K,
+                         uint64_t g0, uint64_t d0, uint64_t n, double *out, NormalMiss *list,
+                         unsigned long long *count, uint64_t cap) {
+    __shared__ NormalMiss q[NORMAL_QUEUE];
+    __shared__ unsigned nq;
+    __shared__ unsigned long long base;
+    __shared__ double firsts[SHIFT ? THREADS / 32 : 1]; /* each warp's first low element */
+    if (threadIdx.x == 0) nq = 0;
+    __syncthreads();
     const uint32_t key[4] = {key0, key1, key2, key3};
-    uint32_t o[4], h[4], po[4] = {0, 0, 0, 0}, ph[4] = {0, 0, 0, 0};
-    F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
-    if (ODD) F_keyed(key, lane ? c - 1u : 8u * g + 7u, DOMAIN_STREAM, AUX_STREAM, po, ph);
-    for (uint32_t j = 0; j < K; j++) {
-        uint64_t beta = (g * K + j) * 8u + lane;
-        if (beta > bb) break;
-        T(o, h);
-        if (ODD && (lane || j)) T(po, ph);
-        if (beta < ba) continue;
-        uint32_t q[4];
-        const uint32_t *prev = po;
-        if (ODD && lane == 0 && j == 0) {
-            block(key, 8u * (g - 1u) + 7u, K - 1u, q);
-            prev = q;
-        }
-        uint64_t u = ODD ? prev[2] | ((uint64_t)prev[3] << 32) : o[0] | ((uint64_t)o[1] << 32);
-        uint64_t v = ODD ? o[0] | ((uint64_t)o[1] << 32) : o[2] | ((uint64_t)o[3] << 32);
-        Pair2<double> z = box_muller2(to_f64(u), to_f64(v));
-        uint64_t e = 2u * (beta - ba);
-        if (e + 1 < n) {
-            if (vec) *reinterpret_cast<double2 *>(out + e) = make_double2(z.z0, z.z1);
-            else { out[e] = (O)z.z0; out[e + 1] = (O)z.z1; }
+    uint64_t c = 8u * g0 + blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    const NormalSpan sp(c, K, d0, n);
+    auto push = [&](uint64_t d, uint64_t r) {
+        unsigned s = atomicAdd(&nq, 1u);
+        if (s < NORMAL_QUEUE) {
+            q[s] = NormalMiss{d - d0, r};
         } else {
-            out[e] = (O)z.z0;
+            unsigned long long t = atomicAdd(count, 1ull);
+            if (t < cap) list[t] = NormalMiss{d - d0, r};
         }
+    };
+    /* The fast path of draws d and d + 1, queueing their misses. */
+    auto fast = [&](uint64_t d, uint64_t r0, uint64_t r1, bool edge, double &z0, double &z1) {
+        bool h0, h1;
+        z0 = normal_f64_fast(r0, h0);
+        z1 = normal_f64_fast(r1, h1);
+        if (__builtin_expect(!(h0 && h1), 0)) {
+            if (!h0 && (!edge || sp.in(d))) push(d, r0);
+            if (!h1 && (!edge || sp.in(d + 1u))) push(d + 1u, r1);
+        }
+    };
+    if constexpr (!SHIFT) {
+        /* Each block is stored one step late, so that the store does not wait for the step's
+         * table reads. */
+        int steps = sp.jl + 1;
+        uint32_t o[4], h[4];
+        F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
+        double z0 = 0.0, z1 = 0.0;
+        bool prev_edge = true;
+        uint64_t d = 2u * sp.beta0;
+        double *dst = out + (d - d0) - 16; /* the previous step's block */
+        int j = 0;
+        for (; j < steps; j++, d += 16u, dst += 16) {
+            T(o, h);
+            uint64_t r0 = o[0] | ((uint64_t)o[1] << 32), r1 = o[2] | ((uint64_t)o[3] << 32);
+            bool edge = j <= sp.jf || j >= sp.jl;
+            double n0, n1;
+            fast(d, r0, r1, edge, n0, n1);
+            if (!prev_edge) {
+                *reinterpret_cast<double2 *>(dst) = make_double2(z0, z1);
+            } else if (j) {
+                if (sp.in(d - 16u)) dst[0] = z0;
+                if (sp.in(d - 15u)) dst[1] = z1;
+            }
+            z0 = n0, z1 = n1, prev_edge = edge;
+        }
+        if (j) {
+            if (sp.in(d - 16u)) dst[0] = z0;
+            if (sp.in(d - 15u)) dst[1] = z1;
+        }
+    } else {
+        /* Every thread of the warp takes every step, so that the shuffles see the whole warp. */
+        unsigned wl = threadIdx.x & 31u, lane = threadIdx.x & 7u;
+        uint64_t bw = sp.beta0 - lane - (wl >> 3) * K * 8u; /* the warp's first block at step 0 */
+        int steps = bw > sp.bb ? 0 : (int)((sp.bb - bw) >> 3 < K - 1u ? (sp.bb - bw) >> 3 : K - 1u) + 1;
+        uint32_t o[4], h[4];
+        F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
+        /* The previous step's values, and whether its block or the next one can leave the fill. */
+        double z0 = 0.0, z1 = 0.0, first = 0.0; /* first: the low element at step 0 */
+        bool prev_edge = true;
+        uint64_t d = 2u * sp.beta0;
+        double *dst = out + (d - d0) - 15; /* slot l of the previous step's row */
+        unsigned src = lane < 7 ? wl + 1u : wl - 7u;
+        int j = 0;
+        for (; j < steps; j++, d += 16u, dst += 16) {
+            T(o, h);
+            uint64_t r0 = o[0] | ((uint64_t)o[1] << 32), r1 = o[2] | ((uint64_t)o[3] << 32);
+            bool edge = j <= sp.jf || j >= sp.jl;
+            double n0, n1;
+            fast(d, r0, r1, edge, n0, n1);
+            /* The low element of lane l + 1's previous block, or of lane 0's current one. */
+            double lo = __shfl_sync(0xffffffffu, lane ? z0 : n0, src);
+            if (!prev_edge) {
+                *reinterpret_cast<double2 *>(dst) = make_double2(z1, lo);
+            } else if (j) {
+                if (sp.in(d - 15u)) dst[0] = z1;
+                if (sp.in(d - 14u)) dst[1] = lo;
+            } else if (threadIdx.x == 0 && sp.in(d)) {
+                dst[15] = n0;
+            }
+            if (j == 0) first = n0;
+            z0 = n0, z1 = n1, prev_edge = edge;
+        }
+        /* Lane 7 pairs its last high element with the first low element of the next group, from
+         * the warp or, for its last group, from the next warp through shared memory. A lone
+         * element left at every group's ends a sector half written for another warp to finish much
+         * later, which cost the A100 15 %. Only a block's ends keep one. */
+        unsigned warp = threadIdx.x >> 5;
+        if (wl == 0) firsts[warp] = first;
+        __syncthreads();
+        bool next = wl < 31 || warp + 1 < THREADS / 32;
+        double lo = __shfl_sync(0xffffffffu, lane ? z0 : first, wl < 31 ? wl + 1u : wl);
+        if (wl == 31 && next) lo = firsts[warp + 1];
+        if (j) {
+            bool b = next && sp.in(d - 14u);
+            if (sp.in(d - 15u) && b)
+                *reinterpret_cast<double2 *>(dst) = make_double2(z1, lo);
+            else {
+                if (sp.in(d - 15u)) dst[0] = z1;
+                if (b) dst[1] = lo;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned m = nq < NORMAL_QUEUE ? nq : NORMAL_QUEUE;
+    if (m == 0) return;
+    if (threadIdx.x == 0) base = atomicAdd(count, (unsigned long long)m);
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < m; i += THREADS)
+        if (base + i < cap) list[base + i] = q[i];
+}
+
+/* The misses of the list, or of the whole fill when the list overflowed. */
+__global__ void __launch_bounds__(THREADS)
+    fill_normal64_misses(uint32_t key0, uint32_t key1, uint32_t key2, uint32_t key3, uint32_t K,
+                         uint64_t g0, uint64_t chunks, uint64_t d0, uint64_t n,
+                         const NormalMiss *list, const unsigned long long *count, uint64_t cap,
+                         double *out) {
+    const uint32_t key[4] = {key0, key1, key2, key3};
+    uint64_t m = *count, i0 = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    uint64_t stride = gridDim.x * (uint64_t)blockDim.x;
+    if (m <= cap) {
+        for (uint64_t i = i0; i < m; i += stride) {
+            NormalMiss x = list[i];
+            out[x.e] = normal_f64_slow(x.r, key, K, d0 + x.e);
+        }
+        return;
+    }
+    for (uint64_t i = i0; i < chunks; i += stride) {
+        uint64_t c = 8u * g0 + i;
+        NormalSpan sp(c, K, d0, n);
+        sp.walk(key, c, [&](uint64_t d, uint64_t r0, uint64_t r1, bool) {
+            bool h0, h1;
+            normal_f64_fast(r0, h0);
+            normal_f64_fast(r1, h1);
+            if (sp.in(d) && !h0) out[d - d0] = normal_f64_slow(r0, key, K, d);
+            if (sp.in(d + 1u) && !h1) out[d + 1u - d0] = normal_f64_slow(r1, key, K, d + 1u);
+        });
     }
 }
 
-template <class O>
-inline uint64_t fill_normal(const uint32_t key[4], uint64_t pos, uint32_t K, O *out, size_t n,
-                            cudaStream_t stream) {
+/* Short fills, and fills without the stream-ordered allocator, in one kernel that continues each
+ * miss where it finds it. */
+__global__ void __launch_bounds__(THREADS)
+    fill_normal64_fused(uint32_t key0, uint32_t key1, uint32_t key2, uint32_t key3, uint32_t K,
+                        uint64_t g0, uint64_t d0, uint64_t n, double *out) {
+    const uint32_t key[4] = {key0, key1, key2, key3};
+    uint64_t c = 8u * g0 + blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    const NormalSpan sp(c, K, d0, n);
+    sp.walk(key, c, [&](uint64_t d, uint64_t r0, uint64_t r1, bool) {
+        double *dst = out + (d - d0);
+        if (sp.in(d)) dst[0] = normal_f64(r0, key, K, d);
+        if (sp.in(d + 1u)) dst[1] = normal_f64(r1, key, K, d + 1u);
+    });
+}
+
+/* Fills below this length take the fused kernel and allocate nothing. */
+constexpr size_t NORMAL_LIST_MIN = (size_t)1 << 16;
+
+inline uint64_t fill_normal_f64_impl(const uint32_t key[4], uint64_t pos, uint32_t K, double *out,
+                                     size_t n, cudaStream_t stream) {
     K = K ? K : DEFAULT_K;
-    if (n == 0) return pos; /* consumes no draws, so no alignment either */
-    uint64_t pairs = ((uint64_t)n + 1u) / 2u;
-    uint64_t p0 = align_pos(pos, 64), p1 = p0 + pairs * 128u;
-    bool odd = (p0 >> 6) & 1u;
-    uint64_t ba = (p0 >> 7) + (odd ? 1u : 0u), bb = ba + pairs - 1u;
-    uint64_t g0 = (ba >> 3) / K, g1 = (bb >> 3) / K;
-    unsigned blocks = (unsigned)((8u * (g1 - g0 + 1u) + THREADS - 1) / THREADS);
-    if (odd)
-        fill_normal_kernel<O, true><<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2],
-                                                                    key[3], K, g0, ba, bb, n, out);
+    uint64_t p0 = align_pos(pos, 64);
+    if (n == 0) return p0;
+    uint64_t d0 = p0 >> 6, ba = d0 >> 1, bb = (d0 + n - 1u) >> 1;
+    uint64_t g0 = (ba >> 3) / K, g1 = (bb >> 3) / K, chunks = 8u * (g1 - g0 + 1u);
+    unsigned blocks = (unsigned)((chunks + THREADS - 1) / THREADS);
+    /* Room for twice the expected misses. The stream-ordered allocator reuses the memory of the
+     * last fill. */
+    uint64_t cap = n / 128u;
+    void *scratch = nullptr;
+    if (n < NORMAL_LIST_MIN ||
+        cudaMallocAsync(&scratch, 16 + cap * sizeof(NormalMiss), stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fill_normal64_fused<<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3], K, g0,
+                                                            d0, n, out);
+        return p0 + 64u * (uint64_t)n;
+    }
+    auto count = static_cast<unsigned long long *>(scratch);
+    auto list = reinterpret_cast<NormalMiss *>(static_cast<char *>(scratch) + 16);
+    cudaMemsetAsync(count, 0, sizeof *count, stream);
+    if (((reinterpret_cast<uintptr_t>(out) - 8u * d0) & 15u) == 0)
+        fill_normal64_kernel<false><<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3],
+                                                                    K, g0, d0, n, out, list, count, cap);
     else
-        fill_normal_kernel<O, false><<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2],
-                                                                     key[3], K, g0, ba, bb, n, out);
-    return p1;
+        fill_normal64_kernel<true><<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3],
+                                                                   K, g0, d0, n, out, list, count, cap);
+    /* One thread per expected miss, at 0.43 %. The grid-stride loop takes any excess. */
+    unsigned mblocks = (unsigned)((n / 200u + THREADS - 1) / THREADS);
+    fill_normal64_misses<<<mblocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3], K, g0,
+                                                          chunks, d0, n, list, count, cap, out);
+    cudaFreeAsync(scratch, stream);
+    return p0 + 64u * (uint64_t)n;
 }
 
 /* The float Box-Muller step of the fill kernel. It is box_muller2_f32 with the angle through
@@ -452,7 +667,8 @@ __device__ __forceinline__ Pair2<float> normal_step_f32(float a, float b) {
  * the fill that starts at the position aligned to 32 bits, giving elements 2j and 2j + 1. With
  * s0 the index of the first Float32 draw, a block holds two pairs: slots 0 and 1, 2 and 3 when
  * s0 is even, or slot 3 of the previous block with slot 0, and slots 1 and 2, when s0 is odd.
- * The odd case steps the predecessor chunk as fill_normal_kernel does. `ba` and `bb` bound the
+ * The odd case also steps the chunk that holds the predecessor block: chunk c - 1, or for lane 0
+ * the last lane of the previous row. `ba` and `bb` bound the
  * blocks that can hold a pair, `np` is the number of pairs. */
 template <bool ODD>
 __global__ void __launch_bounds__(THREADS)
@@ -677,21 +893,39 @@ TANDEM_BELOW_LOW(fill_u64_below, uint64_t, uint64_t)
 TANDEM_BELOW_LOW(fill_u64_below, uint64_t, int64_t)
 #undef TANDEM_BELOW_LOW
 
-/* Standard normals by Box-Muller. fill_normal_f64 is the flattened Rng::normal2 calls:
- * pair j, elements 2j (cos half) and 2j + 1 (sin half), comes from the Float64 draws 2j and
- * 2j + 1 of the fill that starts at the position aligned to 64 bits. The fill consumes
- * 2 ceil(n / 2) draws, so an odd n uses the cos half of its last pair and still advances past
- * both draws. fill_normal_f32 is the same on Rng::normalf2 with float arithmetic and Float32
- * draws, aligned to 32 bits. Device log and cos differ
- * from the host's in the last bits, so normals agree to a few ulps, not bit for bit. Not part
- * of the specification. */
+/* Standard normals (spec Appendix A). fill_normal_f64 is the 1024-layer ziggurat: element e from
+ * UInt64 draw e of the fill that starts at pos aligned to 64 bits, so it consumes n draws, equals
+ * the Rng::normal() calls and is bit identical to tandem-c's tandem_fill_normal_f64. A miss
+ * continues on a fallback stream, see PURPOSE_NORMAL64 in core.hpp. n = 0 returns pos aligned to
+ * 64 bits. fill_normal_f32 is Box-Muller on Rng::normalf2: pair j, elements 2j (cos half) and
+ * 2j + 1 (sin half), from the Float32 draws 2j and 2j + 1 of the fill that starts at pos aligned
+ * to 32 bits. It consumes 2 ceil(n / 2) draws, so an odd n uses the cos half of its last pair and
+ * still advances past both draws. Device float log and sincos differ from the host's in the last
+ * bits, so f32 normals agree to a few ulps, not bit for bit. n = 0 returns pos unchanged. */
 inline uint64_t fill_normal_f64(const uint32_t key[4], uint64_t pos, uint32_t K, double *out,
                                 size_t n, cudaStream_t stream = 0) {
-    return detail::fill_normal(key, pos, K, out, n, stream);
+    return detail::fill_normal_f64_impl(key, pos, K, out, n, stream);
 }
 inline uint64_t fill_normal_f32(const uint32_t key[4], uint64_t pos, uint32_t K, float *out,
                                 size_t n, cudaStream_t stream = 0) {
     return detail::fill_normal_f32_impl(key, pos, K, out, n, stream);
+}
+
+/* Standard exponentials -ln(1 - u), element i from Float64 (Float32) draw i of the fill that
+ * starts at pos aligned to 64 (32) bits, so a fill equals the Rng::exponential (exponentialf)
+ * calls and is bit identical to tandem-c's tandem_fill_exponential_f64 (f32). Each thread
+ * stores 2 doubles or 4 floats as one 16-byte vector. n = 0 leaves the position unchanged. Not
+ * part of the specification (Appendix A). The fills run the direct kernel: the map makes them
+ * compute bound, and the A100 lost 7 to 13 % in the tile kernel's separate write phase. */
+inline uint64_t fill_exponential_f64(const uint32_t key[4], uint64_t pos, uint32_t K, double *out,
+                                     size_t n, cudaStream_t stream = 0) {
+    if (n == 0) return pos;
+    return detail::fill<detail::exp_f64>(key, pos, K, out, n, stream, false);
+}
+inline uint64_t fill_exponential_f32(const uint32_t key[4], uint64_t pos, uint32_t K, float *out,
+                                     size_t n, cudaStream_t stream = 0) {
+    if (n == 0) return pos;
+    return detail::fill<detail::exp_f32>(key, pos, K, out, n, stream, false);
 }
 
 /* A host handle for a stream: the fills above, with the position kept and advanced here. Fills
@@ -770,6 +1004,12 @@ struct generator {
     }
     uint64_t fill_normal_f32(float *out, size_t n, cudaStream_t s = 0) {
         return pos = tandem::fill_normal_f32(key, pos, K, out, n, s);
+    }
+    uint64_t fill_exponential_f64(double *out, size_t n, cudaStream_t s = 0) {
+        return pos = tandem::fill_exponential_f64(key, pos, K, out, n, s);
+    }
+    uint64_t fill_exponential_f32(float *out, size_t n, cudaStream_t s = 0) {
+        return pos = tandem::fill_exponential_f32(key, pos, K, out, n, s);
     }
 };
 

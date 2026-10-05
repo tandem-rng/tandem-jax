@@ -91,9 +91,9 @@ void tandem_block(const uint32_t key[4], uint64_t c, uint32_t j, uint32_t out[4]
 #ifndef TANDEM_AVX2_PASS
 /* ---- Public: normals --------------------------------------------------------------------- */
 
-/* Box-Muller without libm in the loop, so that the compiler vectorizes a block of pairs. A
- * pair (a, b) gives r = sqrt(-2 ln(1 - a)) and the normals r cos(2 pi b) and r sin(2 pi b),
- * cos first.
+/* Float32 normals: Box-Muller without libm in the loop, so that the compiler vectorizes a block
+ * of pairs. A pair (a, b) gives r = sqrt(-2 ln(1 - a)) and the normals r cos(2 pi b) and
+ * r sin(2 pi b), cos first.
  *
  * ln(1 - a): 1 - a is exact and in (0, 1]. Split it as m 2^e with m in [sqrt(1/2), sqrt(2)) by
  * its exponent bits, then ln m = 2 s (1 + z/3 + z^2/5 + ...) with s = (m - 1) / (m + 1) and
@@ -107,7 +107,7 @@ void tandem_block(const uint32_t key[4], uint64_t c, uint32_t j, uint32_t out[4]
 #pragma STDC FP_CONTRACT OFF
 #endif
 
-/* Every multiply-add of the normal loop is an explicit fused multiply-add, so that every
+/* Every multiply-add of the normal loops is an explicit fused multiply-add, so that every
  * compiler and target gives the same bits. On hardware without a fused instruction fma() is a
  * correct but slow library call that the compiler cannot vectorize, so x86 runs the AVX2 and FMA
  * copy of the loop when the CPU has them. Plain products and sums are never contracted, because
@@ -176,6 +176,41 @@ FP_INLINE float neg2_log_f32(float x) {
 #define SQRT(x) sqrt(x)
 #define SQRTF(x) sqrtf(x)
 #endif
+
+static inline double to_f64(uint64_t raw) { return (double)(raw >> 11) * 0x1p-53; }
+static inline float to_f32(uint32_t raw) { return (float)(raw >> 8) * 0x1p-24f; }
+
+/* Float64 normals: the 1024-layer ziggurat of Appendix A, one 64-bit draw per element. A draw
+ * that misses the inner rectangles continues on its own fallback stream, split(g) of
+ * sub(PURPOSE_NORMAL64) of the key at position 0, where g is the global index of the draw. So
+ * element i depends on draw i alone and a fill cut anywhere equals the whole fill. The constant
+ * is reserved for this and matches every port. */
+#include "tandem_normal_tables.h"
+#define PURPOSE_NORMAL64 0x4e524d3634ull
+
+/* A fallback stream: its key and the block of its draws 2b and 2b + 1. Draw d sits in row d / 16
+ * and lane (d / 2) mod 8 of the stream order, so each block costs one F and a few steps. */
+typedef struct {
+    uint32_t key[4], blk[4];
+    uint32_t K, d;
+} fallback;
+
+static uint64_t fallback_next(fallback *f) {
+    uint32_t d = f->d++;
+    if (d >= 2u && !(d & 1u)) {
+        uint64_t row = d >> 4;
+        tandem_block(f->key, 8u * (row / f->K) + ((d >> 1) & 7u), (uint32_t)(row % f->K), f->blk);
+    }
+    return (d & 1u) ? f->blk[2] | (uint64_t)f->blk[3] << 32 : f->blk[0] | (uint64_t)f->blk[1] << 32;
+}
+
+typedef struct {
+    double *out;
+    uint64_t r, g;
+} zig_miss;
+
+#define ZIG_BLOCK 512u /* draws per table pass, which stay in L1 */
+#define ZIG_QUEUE 64u  /* misses queued before their streams are seeded */
 #endif /* TANDEM_AVX2_PASS */
 
 #ifndef TANDEM_AVX2_PASS
@@ -346,6 +381,19 @@ static inline void lanes_T(lanes *L) {
     quad_T(&L->q[1]);
 }
 
+/* The end of a round of F: o[0] takes the round constant, then the halves swap. */
+static inline void lanes_round(lanes *L, uint32_t rc) {
+    for (unsigned k = 0; k < 2; k++) {
+        quad *q = &L->q[k];
+        q->o[0] ^= rc;
+        for (unsigned w = 0; w < 4; w++) {
+            u32x4 t = q->o[w];
+            q->o[w] = q->h[w];
+            q->h[w] = t;
+        }
+    }
+}
+
 static inline void lanes_seed(lanes *L, const uint32_t key[4], uint64_t g) {
     quad_seed(&L->q[0], key, 8u * g);
     quad_seed(&L->q[1], key, 8u * g + 4u);
@@ -393,6 +441,14 @@ static inline void lanes_T(lanes *L) {
     }
 }
 
+static inline void lanes_round(lanes *L, uint32_t rc) {
+    uint32_t t[4][8];
+    for (unsigned l = 0; l < 8; l++) L->o[0][l] ^= rc;
+    memcpy(t, L->o, sizeof t);
+    memcpy(L->o, L->h, sizeof t);
+    memcpy(L->h, t, sizeof t);
+}
+
 static inline void lanes_seed(lanes *L, const uint32_t key[4], uint64_t g) {
     for (unsigned l = 0; l < 8; l++) {
         uint32_t o[4], h[4];
@@ -428,6 +484,7 @@ static inline void lanes_store(const lanes *L, char *dst, store_mode mode) {
 #define lanes_load lanes_load_avx2
 #define lanes_save lanes_save_avx2
 #define lanes_T lanes_T_avx2
+#define lanes_round lanes_round_avx2
 #define lanes_seed lanes_seed_avx2
 #define lanes_store lanes_store_avx2
 
@@ -472,6 +529,15 @@ static inline void lanes_T(lanes *L) {
     o[1] = n1;
     o[2] = n2;
     o[3] = n3;
+}
+
+static inline void lanes_round(lanes *L, uint32_t rc) {
+    L->o[0] ^= rc;
+    for (unsigned w = 0; w < 4; w++) {
+        u32x8 t = L->o[w];
+        L->o[w] = L->h[w];
+        L->h[w] = t;
+    }
 }
 
 static inline void lanes_seed(lanes *L, const uint32_t key[4], uint64_t g) {
@@ -546,16 +612,24 @@ static inline void lanes_store(const lanes *L, char *dst, store_mode mode) {
 
 #ifdef TANDEM_AVX2_PASS
 #define RUN_ROWS run_rows_avx2
-#define NORMAL_BLOCK_F64 normal_block_f64_avx2
 #define NORMAL_BLOCK_F32 normal_block_f32_avx2
 #define EXPONENTIAL_BLOCK_F64 exponential_block_f64_avx2
 #define EXPONENTIAL_BLOCK_F32 exponential_block_f32_avx2
+#define LANES_F lanes_F_avx2
+#define FALLBACK_SEED8 fallback_seed8_avx2
+#define ZIG_SLOW zig_slow_avx2
+#define ZIG_RESOLVE zig_resolve_avx2
+#define ZIG_FILL_F64 zig_fill_f64_avx2
 #else
 #define RUN_ROWS run_rows_base
-#define NORMAL_BLOCK_F64 normal_block_f64_base
 #define NORMAL_BLOCK_F32 normal_block_f32_base
 #define EXPONENTIAL_BLOCK_F64 exponential_block_f64_base
 #define EXPONENTIAL_BLOCK_F32 exponential_block_f32_base
+#define LANES_F lanes_F_base
+#define FALLBACK_SEED8 fallback_seed8_base
+#define ZIG_SLOW zig_slow_base
+#define ZIG_RESOLVE zig_resolve_base
+#define ZIG_FILL_F64 zig_fill_f64_base
 #endif
 
 #ifndef TANDEM_AVX2_PASS
@@ -613,43 +687,6 @@ static void RUN_ROWS(tandem_rng *rng, uint64_t row, size_t nrows, char *out, sto
     rng->cached = 1u;
 }
 
-
-NOINLINE static void NORMAL_BLOCK_F64(const double *restrict u, double *restrict z, size_t m) {
-#if defined(__clang__)
-#pragma clang loop interleave_count(8)
-#endif
-    for (size_t j = 0; j < m; j++) {
-        double a = u[2u * j], b = u[2u * j + 1u];
-        double r = SQRT(neg2_log_f64(1.0 - a));
-
-        /* Nearest quarter turn q, and the angle left over in [-pi/4, pi/4]. */
-        int64_t q = (int64_t)(b * 4.0 + 0.5);
-        double f = FMA(-(double)q, 0.25, b), th = f * 6.283185307179586, w = th * th;
-        double hs = FMA(w, FMA(w, FMA(w, FMA(w, FMA(w, 1.5914650986900946e-10,
-                    -2.5051097984389413e-08), 2.755731600073921e-06), -0.00019841269836630226),
-                    0.008333333333330813), -0.16666666666666669);
-        double hc = FMA(w, FMA(w, FMA(w, FMA(w, FMA(w, 2.0665708703855164e-09,
-                    -2.7555858522576447e-07), 2.480158263811954e-05), -0.0013888888882156126),
-                    0.04166666666663108), -0.4999999999999997);
-        double sn = th * FMA(w, hs, 1.0), cs = FMA(w, hc, 1.0);
-
-        /* Rotate by q quarter turns with bit operations: odd q swaps the two, bit 1 of q
-         * negates the sine, and bit 1 of q + 1 negates the cosine. */
-        uint64_t qu = (uint64_t)q, sm = (uint64_t)0 - (qu & 1u), sb, cb, xb, yb;
-        memcpy(&sb, &sn, 8);
-        memcpy(&cb, &cs, 8);
-        xb = (sb & sm) | (cb & ~sm);
-        yb = (cb & sm) | (sb & ~sm);
-        xb ^= ((qu + 1u) << 62) & 0x8000000000000000u;
-        yb ^= (qu << 62) & 0x8000000000000000u;
-        double cx, sx;
-        memcpy(&cx, &xb, 8);
-        memcpy(&sx, &yb, 8);
-        z[2u * j] = r * cx;
-        z[2u * j + 1u] = r * sx;
-    }
-}
-
 NOINLINE static void NORMAL_BLOCK_F32(const float *restrict u, float *restrict z, size_t m) {
 #if defined(__clang__)
 #pragma clang loop interleave_count(8)
@@ -658,6 +695,7 @@ NOINLINE static void NORMAL_BLOCK_F32(const float *restrict u, float *restrict z
         float a = u[2u * j], b = u[2u * j + 1u];
         float r = SQRTF(neg2_log_f32(1.0f - a));
 
+        /* Nearest quarter turn q, and the angle left over in [-pi/4, pi/4]. */
         int32_t q = (int32_t)(b * 4.0f + 0.5f);
         float f = FMAF(-(float)q, 0.25f, b);
         /* 2 pi as a float pair, so that the angle is good to the last bit of the float. */
@@ -667,6 +705,8 @@ NOINLINE static void NORMAL_BLOCK_F32(const float *restrict u, float *restrict z
         float hc = FMAF(w, FMAF(w, FMAF(w, 2.4463761e-05f, -0.0013887589f), 0.04166665f), -0.5f);
         float sn = th * FMAF(w, hs, 1.0f), cs = FMAF(w, hc, 1.0f);
 
+        /* Rotate by q quarter turns with bit operations: odd q swaps the two, bit 1 of q
+         * negates the sine, and bit 1 of q + 1 negates the cosine. */
         uint32_t qu = (uint32_t)q, sm = (uint32_t)0 - (qu & 1u), sb, cb, xb, yb;
         memcpy(&sb, &sn, 4);
         memcpy(&cb, &cs, 4);
@@ -697,17 +737,143 @@ NOINLINE static void EXPONENTIAL_BLOCK_F32(float *z, size_t m) {
     for (size_t j = 0; j < m; j++) z[j] = 0.5f * neg2_log_f32(1.0f - z[j]);
 }
 
+/* ---- Float64 normals: the ziggurat ------------------------------------------------------ */
+
+static inline void LANES_F(lanes *L) {
+    for (int r = 0; r < 8; r++) {
+        lanes_T(L);
+        lanes_round(L, RC[r]);
+    }
+}
+
+/* The fallback streams of eight misses, split(g[l]) of the purpose child sub, with the first
+ * block of each. The eight lanes run the two seedings side by side, at a sixth to a fifth of the
+ * cost of eight separate ones. */
+static void FALLBACK_SEED8(const uint32_t sub[4], const uint64_t g[8], uint32_t K, fallback f[8]) {
+    tandem_rng s; /* only its o and h, the word-major layout of lanes_load and lanes_save */
+    lanes L;
+    for (unsigned l = 0; l < 8; l++) {
+        s.o[0][l] = (uint32_t)(g[l] >> 1);
+        s.o[1][l] = (uint32_t)(g[l] >> 33);
+        s.o[2][l] = DOMAIN_SPLIT;
+        s.o[3][l] = 0;
+        for (unsigned w = 0; w < 4; w++) s.h[w][l] = sub[w];
+    }
+    lanes_load(&L, &s);
+    LANES_F(&L);
+    lanes_save(&L, &s);
+    for (unsigned l = 0; l < 8; l++) {
+        for (unsigned w = 0; w < 4; w++) {
+            uint32_t k = (g[l] & 1u) ? s.h[w][l] : s.o[w][l];
+            f[l].key[w] = s.h[w][l] = k;
+        }
+        s.o[0][l] = 0;
+        s.o[1][l] = 0;
+        s.o[2][l] = DOMAIN_STREAM;
+        s.o[3][l] = AUX_STREAM;
+    }
+    lanes_load(&L, &s);
+    LANES_F(&L);
+    lanes_T(&L);
+    lanes_save(&L, &s);
+    for (unsigned l = 0; l < 8; l++) {
+        for (unsigned w = 0; w < 4; w++) f[l].blk[w] = s.o[w][l];
+        f[l].K = K;
+        f[l].d = 0;
+    }
+}
+
+/* The slow path of Appendix A from a draw r that missed the inner rectangles. ln is
+ * -0.5 neg2_log_f64, which is exact given neg2_log_f64, and every other operation rounds once. */
+NOINLINE static double ZIG_SLOW(uint64_t r, fallback *f) {
+    for (;;) {
+        unsigned i = (unsigned)r & (ZIG_LAYERS - 1u);
+        uint64_t ra = r >> 11;
+        double x = (double)(int64_t)ra * ZIG_W[r & (2u * ZIG_LAYERS - 1u)];
+        if (ra < ZIG_K[i]) return x;
+        if (i == 0) { /* the tail beyond R, by Marsaglia's method */
+            double a, b;
+            do {
+                a = 0.5 * neg2_log_f64(1.0 - to_f64(fallback_next(f))) / ZIG_R;
+                b = 0.5 * neg2_log_f64(1.0 - to_f64(fallback_next(f)));
+            } while (b + b < a * a);
+            return (r >> 10) & 1u ? -(ZIG_R + a) : ZIG_R + a;
+        }
+        double y = ZIG_Y[i] + to_f64(fallback_next(f)) * (ZIG_Y[i + 1] - ZIG_Y[i]);
+        if (-0.5 * neg2_log_f64(y) < -0.5 * (x * x)) return x;
+        r = fallback_next(f);
+    }
+}
+
+/* A short last group repeats its last index, and the spare streams go unused. */
+static void ZIG_RESOLVE(const uint32_t key[4], uint32_t K, const zig_miss *q, size_t nq) {
+    tandem_rng parent, sub;
+    if (nq == 0) return;
+    parent = tandem_from_key(key, 0, K);
+    sub = tandem_sub(&parent, PURPOSE_NORMAL64);
+    for (size_t t = 0; t < nq; t += 8) {
+        size_t m = nq - t < 8 ? nq - t : 8;
+        uint64_t g[8];
+        fallback f[8];
+        for (size_t l = 0; l < 8; l++) g[l] = q[t + (l < m ? l : m - 1)].g;
+        FALLBACK_SEED8(sub.key, g, K, f);
+        for (size_t l = 0; l < m; l++) *q[t + l].out = ZIG_SLOW(q[t + l].r, &f[l]);
+    }
+}
+
+/* Element i from draw i, where g is the global index of draw 0. A branch-free table pass over
+ * each block of draws writes every element and lists the misses. Misses queue across blocks, so
+ * that their fallback streams are seeded eight at a time. Blocks after the first start at a row,
+ * 16 draws, because the u64 fill reads a partial row byte by byte. Inlined into the public fill
+ * of an -mavx2 build, the pass got packed into vectors with lane extracts, 4 % slower on Zen 2. */
+NOINLINE static void ZIG_FILL_F64(tandem_rng *rng, double *out, size_t n, uint64_t g) {
+    uint64_t buf[ZIG_BLOCK];
+    uint32_t miss[ZIG_BLOCK];
+    zig_miss q[ZIG_QUEUE + ZIG_BLOCK];
+    size_t nq = 0, block = ZIG_BLOCK - (size_t)(g & 15u);
+    while (n) {
+        size_t m = n < block ? n : block, nm = 0;
+        block = ZIG_BLOCK;
+        tandem_fill_u64(rng, buf, m);
+#if defined(__clang__)
+#pragma clang loop unroll_count(4)
+#endif
+        for (size_t j = 0; j < m; j++) {
+            uint64_t r = buf[j], ra = r >> 11;
+            out[j] = (double)(int64_t)ra * ZIG_W[r & (2u * ZIG_LAYERS - 1u)];
+            miss[nm] = (uint32_t)j;
+            nm += (size_t)(ra >= ZIG_K[r & (ZIG_LAYERS - 1u)]);
+        }
+        for (size_t t = 0; t < nm; t++) q[nq++] = (zig_miss){out + miss[t], buf[miss[t]], g + miss[t]};
+        if (nq >= ZIG_QUEUE) {
+            size_t full = nq & ~(size_t)7;
+            ZIG_RESOLVE(rng->key, rng->K, q, full);
+            memmove(q, q + full, (nq - full) * sizeof *q);
+            nq -= full;
+        }
+        out += m;
+        g += m;
+        n -= m;
+    }
+    ZIG_RESOLVE(rng->key, rng->K, q, nq);
+}
+
 #undef RUN_ROWS
-#undef NORMAL_BLOCK_F64
 #undef NORMAL_BLOCK_F32
 #undef EXPONENTIAL_BLOCK_F64
 #undef EXPONENTIAL_BLOCK_F32
+#undef LANES_F
+#undef FALLBACK_SEED8
+#undef ZIG_SLOW
+#undef ZIG_RESOLVE
+#undef ZIG_FILL_F64
 
 #ifdef TANDEM_AVX2_PASS
 #undef lanes
 #undef lanes_load
 #undef lanes_save
 #undef lanes_T
+#undef lanes_round
 #undef lanes_seed
 #undef lanes_store
 #endif
@@ -747,14 +913,21 @@ static void run_rows(tandem_rng *rng, uint64_t row, size_t nrows, char *out, sto
     run_rows_base(rng, row, nrows, out, mode);
 }
 
-static void normal_block_f64(const double *restrict u, double *restrict z, size_t m) {
+static double zig_slow(uint64_t r, fallback *f) {
+#ifdef TANDEM_AVX2
+    if (have_avx2()) return zig_slow_avx2(r, f);
+#endif
+    return zig_slow_base(r, f);
+}
+
+static void zig_fill_f64(tandem_rng *rng, double *out, size_t n, uint64_t g) {
 #ifdef TANDEM_AVX2
     if (have_avx2()) {
-        normal_block_f64_avx2(u, z, m);
+        zig_fill_f64_avx2(rng, out, n, g);
         return;
     }
 #endif
-    normal_block_f64_base(u, z, m);
+    zig_fill_f64_base(rng, out, n, g);
 }
 
 static void normal_block_f32(const float *restrict u, float *restrict z, size_t m) {
@@ -814,9 +987,6 @@ static inline uint64_t next(tandem_rng *rng, unsigned w) {
     rng->pos = p + w;
     return read(rng, p, w);
 }
-
-static inline double to_f64(uint64_t raw) { return (double)(raw >> 11) * 0x1p-53; }
-static inline float to_f32(uint32_t raw) { return (float)(raw >> 8) * 0x1p-24f; }
 
 /* (raw >> 5) * 2^-11 as binary16 bits. Every such value is zero or a normal half whose
  * significand is the 11-bit integer k = raw >> 5, so the encoding is exact. */
@@ -1079,11 +1249,28 @@ void tandem_fill_u64_below(tandem_rng *rng, uint64_t *out, size_t len, uint64_t 
     }
 }
 
-void tandem_normal2_f64(tandem_rng *rng, double out[2]) {
-    double u[2];
-    u[0] = tandem_next_f64(rng);
-    u[1] = tandem_next_f64(rng);
-    normal_block_f64(u, out, 1);
+/* The scalar draw seeds its one fallback stream by the public split and sub, and the fills by
+ * eight lanes, so that equal draws in both prove the lanes right. */
+double tandem_normal_f64(tandem_rng *rng) {
+    uint64_t g = align_pos(rng->pos, 64) >> 6, r = next(rng, 64), ra = r >> 11;
+    double x = (double)(int64_t)ra * ZIG_W[r & (2u * ZIG_LAYERS - 1u)];
+    tandem_rng parent, sub, child;
+    fallback f;
+    if (ra < ZIG_K[r & (ZIG_LAYERS - 1u)]) return x;
+    parent = tandem_from_key(rng->key, 0, rng->K);
+    sub = tandem_sub(&parent, PURPOSE_NORMAL64);
+    child = tandem_split(&sub, g);
+    memcpy(f.key, child.key, 16);
+    tandem_block(f.key, 0, 0, f.blk);
+    f.K = rng->K;
+    f.d = 0;
+    return zig_slow(r, &f);
+}
+
+void tandem_fill_normal_f64(tandem_rng *rng, double *out, size_t n) {
+    uint64_t p = align_pos(rng->pos, 64);
+    rng->pos = p; /* an empty fill only aligns */
+    zig_fill_f64(rng, out, n, p >> 6);
 }
 
 void tandem_normal2_f32(tandem_rng *rng, float out[2]) {
@@ -1091,12 +1278,6 @@ void tandem_normal2_f32(tandem_rng *rng, float out[2]) {
     u[0] = tandem_next_f32(rng);
     u[1] = tandem_next_f32(rng);
     normal_block_f32(u, out, 1);
-}
-
-double tandem_normal_f64(tandem_rng *rng) {
-    double z[2];
-    tandem_normal2_f64(rng, z);
-    return z[0];
 }
 
 float tandem_normal_f32(tandem_rng *rng) {
@@ -1110,19 +1291,6 @@ float tandem_normal_f32(tandem_rng *rng) {
  * uniforms come in blocks, which is the same stream as scalar draws because every draw is
  * aligned to its width. */
 #define NORMAL_BLOCK 256u
-
-void tandem_fill_normal_f64(tandem_rng *rng, double *out, size_t n) {
-    double u[2u * NORMAL_BLOCK];
-    size_t pairs = n / 2u;
-    while (pairs) {
-        size_t m = pairs < NORMAL_BLOCK ? pairs : NORMAL_BLOCK;
-        tandem_fill_f64(rng, u, 2u * m);
-        normal_block_f64(u, out, m);
-        out += 2u * m;
-        pairs -= m;
-    }
-    if (n % 2u) *out = tandem_normal_f64(rng);
-}
 
 void tandem_fill_normal_f32(tandem_rng *rng, float *out, size_t n) {
     float u[2u * NORMAL_BLOCK];

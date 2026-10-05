@@ -130,51 +130,107 @@ __global__ void __launch_bounds__(THREADS)
                             out);
 }
 
-/* fill_normal_kernel<double, ODD> of tandem.cuh. */
-template <bool ODD>
-__device__ __forceinline__ void normal64(const uint32_t key[4], uint32_t K, uint64_t g0,
-                                         uint64_t ba, uint64_t bb, uint64_t n, double *out) {
+/* Float64 normals: element e of a row is the ziggurat of UInt64 draw d0 + e. Short fills take
+ * fill_normal64_fused of tandem.cuh, which continues each miss where it finds it. Longer ones
+ * take two kernels as tandem.cuh does, so that the 0.43 % of misses do not stall whole warps: a
+ * table pass writes the fast path of every element and queues its misses in shared memory, which a
+ * block appends to its row's list with one atomic add, and a second kernel continues the listed
+ * misses, one thread each. A row whose list overflows continues every
+ * miss on a second walk. */
+__global__ void __launch_bounds__(THREADS)
+    normal64_fused(const uint32_t *prm, uint32_t K, uint64_t n, uint64_t row0, double *out) {
+    uint64_t row = row0 + blockIdx.y;
+    Params q = load(prm + PARAMS * row);
+    out += n * row;
+    uint64_t d0 = align_pos(q.pos, 64) >> 6, g0 = (d0 >> 4) / K;
     uint64_t c = 8u * g0 + blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
-    uint64_t g = c >> 3, lane = c & 7u;
-    if (g * K * 8u > bb) return;
-    const bool vec = (reinterpret_cast<uintptr_t>(out) & 15u) == 0;
-    uint32_t o[4], h[4], po[4] = {0, 0, 0, 0}, ph[4] = {0, 0, 0, 0};
-    F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
-    if (ODD) F_keyed(key, lane ? c - 1u : 8u * g + 7u, DOMAIN_STREAM, AUX_STREAM, po, ph);
-    for (uint32_t j = 0; j < K; j++) {
-        uint64_t beta = (g * K + j) * 8u + lane;
-        if (beta > bb) break;
-        T(o, h);
-        if (ODD && (lane || j)) T(po, ph);
-        if (beta < ba) continue;
-        uint32_t q[4];
-        const uint32_t *prev = po;
-        if (ODD && lane == 0 && j == 0) {
-            block(key, 8u * (g - 1u) + 7u, K - 1u, q);
-            prev = q;
-        }
-        uint64_t u = ODD ? prev[2] | ((uint64_t)prev[3] << 32) : o[0] | ((uint64_t)o[1] << 32);
-        uint64_t v = ODD ? o[0] | ((uint64_t)o[1] << 32) : o[2] | ((uint64_t)o[3] << 32);
-        Pair2<double> z = box_muller2(to_f64(u), to_f64(v));
-        uint64_t e = 2u * (beta - ba);
-        if (e + 1 < n) {
-            if (vec) *reinterpret_cast<double2 *>(out + e) = make_double2(z.z0, z.z1);
-            else { out[e] = z.z0; out[e + 1] = z.z1; }
-        } else {
-            out[e] = z.z0;
-        }
-    }
+    const NormalSpan sp(c, K, d0, n);
+    sp.walk(q.key, c, [&](uint64_t d, uint64_t r0, uint64_t r1, bool) {
+        if (sp.in(d)) out[d - d0] = normal_f64(r0, q.key, K, d);
+        if (sp.in(d + 1u)) out[d + 1u - d0] = normal_f64(r1, q.key, K, d + 1u);
+    });
 }
 
 __global__ void __launch_bounds__(THREADS)
-    normal64_kernel(const uint32_t *prm, uint32_t K, uint64_t n, uint64_t row0, double *out) {
+    normal64_table(const uint32_t *prm, uint32_t K, uint64_t n, uint64_t row0, double *out,
+                   NormalMiss *lists, unsigned long long *counts, uint64_t cap) {
+    __shared__ NormalMiss queue[NORMAL_QUEUE];
+    __shared__ unsigned nq;
+    __shared__ unsigned long long base;
+    if (threadIdx.x == 0) nq = 0;
+    __syncthreads();
     uint64_t row = row0 + blockIdx.y;
     Params q = load(prm + PARAMS * row);
-    uint64_t pairs = (n + 1) / 2, p0 = align_pos(q.pos, 64);
-    bool odd = (p0 >> 6) & 1u;
-    uint64_t ba = (p0 >> 7) + (odd ? 1u : 0u), bb = ba + pairs - 1u, g0 = (ba >> 3) / K;
-    if (odd) normal64<true>(q.key, K, g0, ba, bb, n, out + n * row);
-    else normal64<false>(q.key, K, g0, ba, bb, n, out + n * row);
+    out += n * row;
+    NormalMiss *list = lists + cap * row;
+    unsigned long long *count = counts + row;
+    uint64_t d0 = align_pos(q.pos, 64) >> 6, g0 = (d0 >> 4) / K;
+    uint64_t c = 8u * g0 + blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    const NormalSpan sp(c, K, d0, n);
+    /* A block's two elements share a 16-byte slot when the output and the stream agree modulo
+     * 16 bytes, as for a start at an even draw. */
+    const bool vec = ((reinterpret_cast<uintptr_t>(out) - 8u * d0) & 15u) == 0;
+    auto push = [&](uint64_t e, uint64_t r) {
+        unsigned s = atomicAdd(&nq, 1u);
+        if (s < NORMAL_QUEUE) {
+            queue[s] = NormalMiss{e, r};
+        } else {
+            unsigned long long t = atomicAdd(count, 1ull);
+            if (t < cap) list[t] = NormalMiss{e, r};
+        }
+    };
+    sp.walk(q.key, c, [&](uint64_t d, uint64_t r0, uint64_t r1, bool edge) {
+        bool h0, h1;
+        double z0 = normal_f64_fast(r0, h0), z1 = normal_f64_fast(r1, h1);
+        bool in0 = !edge || sp.in(d), in1 = !edge || sp.in(d + 1u);
+        if (vec && in0 && in1) {
+            *reinterpret_cast<double2 *>(out + (d - d0)) = make_double2(z0, z1);
+        } else {
+            if (in0) out[d - d0] = z0;
+            if (in1) out[d + 1u - d0] = z1;
+        }
+        if (__builtin_expect(!(h0 && h1), 0)) {
+            if (!h0 && in0) push(d - d0, r0);
+            if (!h1 && in1) push(d + 1u - d0, r1);
+        }
+    });
+    __syncthreads();
+    unsigned m = nq < NORMAL_QUEUE ? nq : NORMAL_QUEUE;
+    if (m == 0) return;
+    if (threadIdx.x == 0) base = atomicAdd(count, (unsigned long long)m);
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < m; i += THREADS)
+        if (base + i < cap) list[base + i] = queue[i];
+}
+
+__global__ void __launch_bounds__(THREADS)
+    normal64_misses(const uint32_t *prm, uint32_t K, uint64_t n, uint64_t row0, double *out,
+                    const NormalMiss *lists, const unsigned long long *counts, uint64_t cap) {
+    uint64_t row = row0 + blockIdx.y;
+    Params q = load(prm + PARAMS * row);
+    out += n * row;
+    const NormalMiss *list = lists + cap * row;
+    uint64_t m = counts[row], d0 = align_pos(q.pos, 64) >> 6;
+    uint64_t i0 = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x, stride = gridDim.x * (uint64_t)blockDim.x;
+    if (m <= cap) {
+        for (uint64_t i = i0; i < m; i += stride) {
+            NormalMiss x = list[i];
+            out[x.e] = normal_f64_slow(x.r, q.key, K, d0 + x.e);
+        }
+        return;
+    }
+    uint64_t g0 = (d0 >> 4) / K, chunks = 8u * (((d0 + n - 1u) >> 4) / K - g0 + 1u);
+    for (uint64_t i = i0; i < chunks; i += stride) {
+        uint64_t c = 8u * g0 + i;
+        NormalSpan sp(c, K, d0, n);
+        sp.walk(q.key, c, [&](uint64_t d, uint64_t r0, uint64_t r1, bool) {
+            bool h0, h1;
+            normal_f64_fast(r0, h0);
+            normal_f64_fast(r1, h1);
+            if (sp.in(d) && !h0) out[d - d0] = normal_f64_slow(r0, q.key, K, d);
+            if (sp.in(d + 1u) && !h1) out[d + 1u - d0] = normal_f64_slow(r1, q.key, K, d + 1u);
+        });
+    }
 }
 
 /* fill_normal32_kernel<ODD> of tandem.cuh. */
@@ -261,6 +317,21 @@ ffi::Error Fill(cudaStream_t stream, ffi::Buffer<ffi::U32> prm, ffi::Result<ffi:
     void *o = out->untyped_data();
     ffi::DataType t = out->element_type();
     using D = ffi::DataType;
+    /* The miss lists of the f64 normals, room for twice the expected misses of each row, from the
+     * stream-ordered allocator as tandem.cuh takes them. Without it the fused kernel runs. */
+    NormalMiss *list = nullptr;
+    unsigned long long *counts = nullptr;
+    uint64_t cap = m / 128u, head = (rows * sizeof *counts + 15u) & ~(uint64_t)15u;
+    void *scratch = nullptr;
+    if (kind == "normal" && t == D::F64 && m >= NORMAL_LIST_MIN) {
+        if (cudaMallocAsync(&scratch, head + rows * cap * sizeof(NormalMiss), stream) == cudaSuccess) {
+            counts = static_cast<unsigned long long *>(scratch);
+            list = reinterpret_cast<NormalMiss *>(static_cast<char *>(scratch) + head);
+            cudaMemsetAsync(counts, 0, rows * sizeof *counts, stream);
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
     for (uint64_t row0 = 0; row0 < rows; row0 += MAX_GRID_Y) {
         unsigned y = (unsigned)(rows - row0 < MAX_GRID_Y ? rows - row0 : MAX_GRID_Y);
         if (kind == "stream") {
@@ -293,9 +364,17 @@ ffi::Error Fill(cudaStream_t stream, ffi::Buffer<ffi::U32> prm, ffi::Result<ffi:
                 return ffi::Error::InvalidArgument("tandem_fill: below needs u32, s32, u64 or s64");
         } else if (kind == "normal") {
             uint64_t pairs = (m + 1) / 2;
-            if (t == D::F64)
-                normal64_kernel<<<dim3(normal_grid(pairs, K), y), THREADS, 0, stream>>>(p, K, m, row0, (double *)o);
-            else if (t == D::F32)
+            if (t == D::F64) {
+                dim3 grid(normal_grid(pairs + 1, K), y);
+                if (!list)
+                    normal64_fused<<<grid, THREADS, 0, stream>>>(p, K, m, row0, (double *)o);
+                else {
+                    normal64_table<<<grid, THREADS, 0, stream>>>(p, K, m, row0, (double *)o, list, counts, cap);
+                    /* One thread per expected miss, at 0.43 %. The grid-stride loop takes any excess. */
+                    dim3 mgrid((unsigned)((m / 200u + THREADS) / THREADS), y);
+                    normal64_misses<<<mgrid, THREADS, 0, stream>>>(p, K, m, row0, (double *)o, list, counts, cap);
+                }
+            } else if (t == D::F32)
                 normal32_kernel<<<dim3(normal_grid((2 * pairs + 2) / 4, K), y), THREADS, 0, stream>>>(
                     p, K, m, row0, (float *)o);
             else
@@ -304,6 +383,7 @@ ffi::Error Fill(cudaStream_t stream, ffi::Buffer<ffi::U32> prm, ffi::Result<ffi:
             return ffi::Error::InvalidArgument("tandem_fill: kind must be stream, below or normal");
         }
     }
+    if (scratch) cudaFreeAsync(scratch, stream);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(e));
     return ffi::Error::Success();
