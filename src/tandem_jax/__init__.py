@@ -448,8 +448,11 @@ def _zig_fast(r):
 
 
 _WEDGE, _REDRAW, _TAIL_A, _TAIL_B = range(4)
-_ZIG_SHARE = 64
-"""The slow path takes up to one element in this many, 3.6 times the expected misses."""
+_ZIG_SHARE = 128
+"""The slow path takes up to one element in this many, 1.8 times the expected misses."""
+_ZIG_GROUP = 16
+"""Misses are gathered from groups of this many elements, so that one pass of the gather runs
+over a sixteenth of the fill and the other over an eighth."""
 
 
 def _zig_slow(key, g, r, pending, K):
@@ -468,8 +471,11 @@ def _zig_slow(key, g, r, pending, K):
     zero = jnp.zeros(g.shape)
 
     def body(st):
-        d, phase, r, x, a, out, pend = st
-        v = _fallback_draw(child, d, 64, K)
+        d, blk, phase, r, x, a, out, pend = st
+        # Draws 2b and 2b + 1 share stream block b, so an odd draw reuses the block of the last.
+        blk = lax.cond((d & 1) == 0, lambda: _fallback_block(child, d >> 1, K), lambda: blk)
+        odd = (d & 1) == 1
+        v = jnp.where(odd, blk[2], blk[0]).astype(jnp.uint64) | (jnp.where(odd, blk[3], blk[1]).astype(jnp.uint64) << jnp.uint64(32))
         u = (v >> jnp.uint64(11)).astype(jnp.float64) * 2.0**-53
         i = layer(r)
         R_ = _opaque(R, u)
@@ -491,6 +497,7 @@ def _zig_slow(key, g, r, pending, K):
         redraw = pend & (phase == _REDRAW)
         return (
             d + U32(1),
+            blk,
             jnp.where(pend, after, phase),
             jnp.where(redraw, v, r),
             jnp.where(redraw, x2, x),
@@ -499,8 +506,8 @@ def _zig_slow(key, g, r, pending, K):
             pend & ~done,
         )
 
-    init = (U32(0), phase, r, x, zero, zero, pending)
-    return lax.while_loop(lambda st: st[-1].any(), body, init)[5]
+    init = (U32(0), jnp.zeros((4,) + g.shape, U32), phase, r, x, zero, zero, pending)
+    return lax.while_loop(lambda st: st[-1].any(), body, init)[6]
 
 
 def _ziggurat(key, position, n, chunk):
@@ -508,13 +515,22 @@ def _ziggurat(key, position, n, chunk):
     x, miss = _zig_fast(r)
     g0 = pos // jnp.uint64(64) - jnp.uint64(n)
     key = tuple(key)
-    # 0.43 % of the draws miss. Gathering them takes one pass, and the slow path then runs on a
-    # few times the expected count, or on every element when more miss than that.
+    # 0.43 % of the draws miss. The slow path runs on up to cap of them, gathered in two passes:
+    # the groups that hold a miss, then the misses of those groups, of which there are no more
+    # than misses. When more miss than cap, it runs on every element.
     cap = min(n, max(_RETRY_MAX, n // _ZIG_SHARE))
-    count = miss.sum()
+    G = _ZIG_GROUP
+    groups = -(-n // G)
+    by_group = jnp.pad(miss, (0, groups * G - n)).reshape(groups, G)
+    hit = by_group.any(1)
+    count, ngroups = miss.sum(), hit.sum()
+    gcap = min(groups, cap)
 
     def few(_):
-        idx = jnp.nonzero(miss, size=cap, fill_value=0)[0]
+        rows = jnp.nonzero(hit, size=gcap, fill_value=0)[0]
+        sel = by_group[rows] & (jnp.arange(gcap) < ngroups)[:, None]
+        flat = jnp.nonzero(sel.reshape(-1), size=cap, fill_value=0)[0]
+        idx = rows[flat // G] * G + flat % G
         active = jnp.arange(cap) < count
         fixed = _zig_slow(key, g0 + idx.astype(jnp.uint64), r[idx], active, chunk)
         return x.at[jnp.where(active, idx, n)].set(fixed, mode="drop")
@@ -560,17 +576,22 @@ def _threshold(r, w):
     return (zero - r) % jnp.where(r == 0, one, r)
 
 
-def _fallback_draw(child, d, w, K):
-    """Draw `d` of the streams of the child keys `child` (four arrays), from position 0."""
-    word = d if w == 32 else d * 2
-    block, offset = word >> 2, word & 3
+def _fallback_block(child, block, K):
+    """Stream block `block` (four words) of the child keys `child` (four arrays), from position 0."""
     row, lane = block >> 3, block & 7
     shift = K.bit_length() - 1
     chunk = (row >> shift) * 8 + lane
     shape = child[0].shape
     o, h = _core.F_keyed(child, (jnp.full(shape, chunk, U32), jnp.zeros(shape, U32)), _core.DOMAIN_STREAM, _core.AUX_STREAM)
     o, h = lax.fori_loop(jnp.int32(0), ((row & (K - 1)) + 1).astype(jnp.int32), lambda _, s: _core.T(*s), (o, h))
-    words = jnp.stack(o)
+    return jnp.stack(o)
+
+
+def _fallback_draw(child, d, w, K):
+    """Draw `d` of the streams of the child keys `child` (four arrays), from position 0."""
+    word = d if w == 32 else d * 2
+    offset = word & 3
+    words = _fallback_block(child, word >> 2, K)
     if w == 32:
         return words[offset]
     return words[offset].astype(jnp.uint64) | (words[offset + 1].astype(jnp.uint64) << jnp.uint64(32))
