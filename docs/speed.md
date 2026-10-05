@@ -56,5 +56,7 @@ few percent. The `float64` normals are the ziggurat's two kernels, a table pass 
 the misses, as in tandem-cuda, which writes 788 to 825 GiB/s at 2^24. The kernels take the same
 time here. The miss list comes from XLA's scratch allocator. A stream-ordered allocation in each
 call held 2^24 at 468 GiB/s, because XLA's event syncs let the pool release the list between calls.
-Without the extension a GPU runs the XLA path, at 93 to 158 GiB/s for these draws at 2^27 and 35
-GiB/s for the `float64` normals, measured before the XLA path found its misses by a binary search.
+Without the extension a GPU runs the XLA path, at 93 to 158 GiB/s for these draws at 2^27. Its
+`float64` normals write 70 GiB/s at 2^27 and 45 at 2^24, against 45 and 41 before the XLA path
+found its misses by a binary search. Those four figures come from tandem-cuda's steady-state
+method: each fill runs for two seconds, then the median of 21 calls, and two runs agreed within 5 %.
