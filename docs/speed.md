@@ -38,13 +38,13 @@ seven runs in GiB/s of output.
 | uniform float32 | 24 | 730 | 523 |
 | uniform float64 | 24 | 1125 | 973 |
 | normal float32 | 24 | 841 | 418 |
-| normal float64 | 24 | 468 | 226 |
+| normal float64 | 24 | 768 | 226 |
 | randint int32 in [0, 1000) | 24 | 919 | 298 |
 | randint int64 in [0, 1000) | 24 | 1041 | 537 |
 | uniform float32 | 27 | 1304 | 656 |
 | uniform float64 | 27 | 1345 | 991 |
 | normal float32 | 27 | 1193 | 427 |
-| normal float64 | 27 | 953 | 220 |
+| normal float64 | 27 | 1036 | 220 |
 | randint int32 in [0, 1000) | 27 | 1216 | 329 |
 | randint int64 in [0, 1000) | 27 | 1277 | 567 |
 
@@ -52,7 +52,8 @@ The kernels alone, as the JAX profiler times them at 2^27, write 1280 to 1390 Gi
 tandem-cuda's own benchmark. At 2^24 the launch and dispatch cost of each call is a larger share,
 and uniform `float32` there ranged from 717 to 984 GiB/s over three runs. The other cells moved by a
 few percent. The `float64` normals are the ziggurat's two kernels, a table pass and a pass over
-the misses, plus a stream-ordered allocation of the miss list in each call. That fixed cost puts
-2^24 at 468 GiB/s, against 706 for the Box-Muller kernel before, while 2^27 rose from 740 to 953.
+the misses, as in tandem-cuda, which writes 788 to 825 GiB/s at 2^24. The kernels take the same
+time here. The miss list comes from XLA's scratch allocator. A stream-ordered allocation in each
+call held 2^24 at 468 GiB/s, because XLA's event syncs let the pool release the list between calls.
 Without the extension a GPU runs the XLA path, at 93 to 158 GiB/s for these draws at 2^27 and 35
 GiB/s for the `float64` normals, whose misses the XLA path gathers with one pass over the fill.
