@@ -2,6 +2,10 @@
 
 # tandem-jax
 
+[![CI](https://github.com/tandem-rng/tandem-jax/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tandem-rng/tandem-jax/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-tandem--rng.github.io-7fb3ee.svg)](https://tandem-rng.github.io/tandem-jax/)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE)
+
 JAX key implementation of [Tandem8x32](https://github.com/tandem-rng/spec), a noncryptographic
 pseudorandom number generator. It is pure Python over `jax.numpy` and `jax.lax`, with optional
 fills from [tandem-c](https://github.com/tandem-rng/tandem-c) on the CPU and
@@ -127,7 +131,8 @@ best of seven runs, GiB/s of output. `jax.random` uses the default threefry2x32 
 | randint int32 in [0, 1000) | 27 | 1216 | 329 |
 | randint int64 in [0, 1000) | 27 | 1277 | 567 |
 
-Longer notes on use, install, tests, and speed are in [docs/notes.md](docs/notes.md).
+See [API](docs/api.md), [design](docs/design.md), [tests](docs/tests.md) and
+[speed](docs/speed.md) for the longer notes.
 
 ## AI assistance
 
@@ -138,6 +143,4 @@ the specification and against long stream dumps from the Julia implementation,
 and every value must match. The output does not depend on who or what wrote the
 code.
 
-## License
-
-Apache License 2.0. See `LICENSE` and `NOTICE`.
+[Documentation](https://tandem-rng.github.io/tandem-jax/) · [Apache 2.0 license](LICENSE)
