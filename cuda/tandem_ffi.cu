@@ -10,6 +10,7 @@
  * to out + b n, as grid row b.
  */
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 
@@ -151,12 +152,105 @@ __global__ void __launch_bounds__(THREADS)
     });
 }
 
+/* The table pass of fill_normal64_kernel<SHIFT> of tandem.cuh, stores included. */
+template <bool SHIFT>
+__device__ __forceinline__ void normal64_table_pass(const uint32_t key[4], uint32_t K, uint64_t c,
+                                                    const NormalSpan &sp, double *out,
+                                                    double *firsts, auto &&push) {
+    const uint64_t d0 = sp.d0;
+    auto fast = [&](uint64_t d, uint64_t r0, uint64_t r1, bool edge, double &z0, double &z1) {
+        bool h0, h1;
+        z0 = normal_f64_fast(r0, h0);
+        z1 = normal_f64_fast(r1, h1);
+        if (__builtin_expect(!(h0 && h1), 0)) {
+            if (!h0 && (!edge || sp.in(d))) push(d - d0, r0);
+            if (!h1 && (!edge || sp.in(d + 1u))) push(d + 1u - d0, r1);
+        }
+    };
+    uint32_t o[4], h[4];
+    if constexpr (!SHIFT) {
+        /* Each block is stored one step late, so that the store does not wait for the step's
+         * table reads. */
+        int steps = sp.jl + 1;
+        F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
+        double z0 = 0.0, z1 = 0.0;
+        bool prev_edge = true;
+        uint64_t d = 2u * sp.beta0;
+        double *dst = out + (d - d0) - 16;
+        int j = 0;
+        for (; j < steps; j++, d += 16u, dst += 16) {
+            T(o, h);
+            uint64_t r0 = o[0] | ((uint64_t)o[1] << 32), r1 = o[2] | ((uint64_t)o[3] << 32);
+            bool edge = j <= sp.jf || j >= sp.jl;
+            double n0, n1;
+            fast(d, r0, r1, edge, n0, n1);
+            if (!prev_edge) {
+                *reinterpret_cast<double2 *>(dst) = make_double2(z0, z1);
+            } else if (j) {
+                if (sp.in(d - 16u)) dst[0] = z0;
+                if (sp.in(d - 15u)) dst[1] = z1;
+            }
+            z0 = n0, z1 = n1, prev_edge = edge;
+        }
+        if (j) {
+            if (sp.in(d - 16u)) dst[0] = z0;
+            if (sp.in(d - 15u)) dst[1] = z1;
+        }
+    } else {
+        /* Every thread of the warp takes every step, so that the shuffles see the whole warp. */
+        unsigned wl = threadIdx.x & 31u, lane = threadIdx.x & 7u;
+        uint64_t bw = sp.beta0 - lane - (wl >> 3) * K * 8u; /* the warp's first block at step 0 */
+        int steps = bw > sp.bb ? 0 : (int)((sp.bb - bw) >> 3 < K - 1u ? (sp.bb - bw) >> 3 : K - 1u) + 1;
+        F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
+        double z0 = 0.0, z1 = 0.0, first = 0.0;
+        bool prev_edge = true;
+        uint64_t d = 2u * sp.beta0;
+        double *dst = out + (d - d0) - 15;
+        unsigned src = lane < 7 ? wl + 1u : wl - 7u;
+        int j = 0;
+        for (; j < steps; j++, d += 16u, dst += 16) {
+            T(o, h);
+            uint64_t r0 = o[0] | ((uint64_t)o[1] << 32), r1 = o[2] | ((uint64_t)o[3] << 32);
+            bool edge = j <= sp.jf || j >= sp.jl;
+            double n0, n1;
+            fast(d, r0, r1, edge, n0, n1);
+            double lo = __shfl_sync(0xffffffffu, lane ? z0 : n0, src);
+            if (!prev_edge) {
+                *reinterpret_cast<double2 *>(dst) = make_double2(z1, lo);
+            } else if (j) {
+                if (sp.in(d - 15u)) dst[0] = z1;
+                if (sp.in(d - 14u)) dst[1] = lo;
+            } else if (threadIdx.x == 0 && sp.in(d)) {
+                dst[15] = n0;
+            }
+            if (j == 0) first = n0;
+            z0 = n0, z1 = n1, prev_edge = edge;
+        }
+        unsigned warp = threadIdx.x >> 5;
+        if (wl == 0) firsts[warp] = first;
+        __syncthreads();
+        bool next = wl < 31 || warp + 1 < THREADS / 32;
+        double lo = __shfl_sync(0xffffffffu, lane ? z0 : first, wl < 31 ? wl + 1u : wl);
+        if (wl == 31 && next) lo = firsts[warp + 1];
+        if (j) {
+            bool b = next && sp.in(d - 14u);
+            if (sp.in(d - 15u) && b)
+                *reinterpret_cast<double2 *>(dst) = make_double2(z1, lo);
+            else {
+                if (sp.in(d - 15u)) dst[0] = z1;
+                if (b) dst[1] = lo;
+            }
+        }
+    }
+}
+
 __global__ void __launch_bounds__(THREADS)
     normal64_table(const uint32_t *prm, uint32_t K, uint64_t n, uint64_t row0, double *out,
                    NormalMiss *lists, unsigned long long *counts, uint64_t cap) {
     __shared__ NormalMiss queue[NORMAL_QUEUE];
     __shared__ unsigned nq;
     __shared__ unsigned long long base;
+    __shared__ double firsts[THREADS / 32];
     if (threadIdx.x == 0) nq = 0;
     __syncthreads();
     uint64_t row = row0 + blockIdx.y;
@@ -167,9 +261,6 @@ __global__ void __launch_bounds__(THREADS)
     uint64_t d0 = align_pos(q.pos, 64) >> 6, g0 = (d0 >> 4) / K;
     uint64_t c = 8u * g0 + blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     const NormalSpan sp(c, K, d0, n);
-    /* A block's two elements share a 16-byte slot when the output and the stream agree modulo
-     * 16 bytes, as for a start at an even draw. */
-    const bool vec = ((reinterpret_cast<uintptr_t>(out) - 8u * d0) & 15u) == 0;
     auto push = [&](uint64_t e, uint64_t r) {
         unsigned s = atomicAdd(&nq, 1u);
         if (s < NORMAL_QUEUE) {
@@ -179,21 +270,11 @@ __global__ void __launch_bounds__(THREADS)
             if (t < cap) list[t] = NormalMiss{e, r};
         }
     };
-    sp.walk(q.key, c, [&](uint64_t d, uint64_t r0, uint64_t r1, bool edge) {
-        bool h0, h1;
-        double z0 = normal_f64_fast(r0, h0), z1 = normal_f64_fast(r1, h1);
-        bool in0 = !edge || sp.in(d), in1 = !edge || sp.in(d + 1u);
-        if (vec && in0 && in1) {
-            *reinterpret_cast<double2 *>(out + (d - d0)) = make_double2(z0, z1);
-        } else {
-            if (in0) out[d - d0] = z0;
-            if (in1) out[d + 1u - d0] = z1;
-        }
-        if (__builtin_expect(!(h0 && h1), 0)) {
-            if (!h0 && in0) push(d - d0, r0);
-            if (!h1 && in1) push(d + 1u - d0, r1);
-        }
-    });
+    /* The same for the whole grid row, so the shuffles and barriers of SHIFT see every thread. */
+    if (((reinterpret_cast<uintptr_t>(out) - 8u * d0) & 15u) == 0)
+        normal64_table_pass<false>(q.key, K, c, sp, out, firsts, push);
+    else
+        normal64_table_pass<true>(q.key, K, c, sp, out, firsts, push);
     __syncthreads();
     unsigned m = nq < NORMAL_QUEUE ? nq : NORMAL_QUEUE;
     if (m == 0) return;
@@ -304,8 +385,9 @@ unsigned normal_grid(uint64_t blocks, uint32_t K) {
     return (unsigned)((8u * groups + THREADS - 1) / THREADS);
 }
 
-ffi::Error Fill(cudaStream_t stream, ffi::Buffer<ffi::U32> prm, ffi::Result<ffi::AnyBuffer> out,
-                int64_t n, int64_t chunk, std::string_view kind, int32_t width) {
+ffi::Error Fill(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::Buffer<ffi::U32> prm,
+                ffi::Result<ffi::AnyBuffer> out, int64_t n, int64_t chunk, std::string_view kind,
+                int32_t width) {
     uint64_t rows = prm.element_count() / PARAMS, m = (uint64_t)n;
     uint32_t K = (uint32_t)chunk;
     if (prm.element_count() % PARAMS || rows * m != out->element_count())
@@ -317,19 +399,18 @@ ffi::Error Fill(cudaStream_t stream, ffi::Buffer<ffi::U32> prm, ffi::Result<ffi:
     void *o = out->untyped_data();
     ffi::DataType t = out->element_type();
     using D = ffi::DataType;
-    /* The miss lists of the f64 normals, room for twice the expected misses of each row, from the
-     * stream-ordered allocator as tandem.cuh takes them. Without it the fused kernel runs. */
+    /* The miss lists of the f64 normals, room for twice the expected misses of each row, from
+     * XLA's scratch allocator. tandem.cuh takes them from the stream-ordered pool, but XLA's event
+     * syncs let that pool release them, and each call then paid about 0.6 ms on the host to map
+     * the memory again. Without scratch memory the fused kernel runs. */
     NormalMiss *list = nullptr;
     unsigned long long *counts = nullptr;
     uint64_t cap = m / 128u, head = (rows * sizeof *counts + 15u) & ~(uint64_t)15u;
-    void *scratch = nullptr;
     if (kind == "normal" && t == D::F64 && m >= NORMAL_LIST_MIN) {
-        if (cudaMallocAsync(&scratch, head + rows * cap * sizeof(NormalMiss), stream) == cudaSuccess) {
-            counts = static_cast<unsigned long long *>(scratch);
-            list = reinterpret_cast<NormalMiss *>(static_cast<char *>(scratch) + head);
+        if (std::optional<void *> s = scratch.Allocate(head + rows * cap * sizeof(NormalMiss), 16)) {
+            counts = static_cast<unsigned long long *>(*s);
+            list = reinterpret_cast<NormalMiss *>(static_cast<char *>(*s) + head);
             cudaMemsetAsync(counts, 0, rows * sizeof *counts, stream);
-        } else {
-            (void)cudaGetLastError();
         }
     }
     for (uint64_t row0 = 0; row0 < rows; row0 += MAX_GRID_Y) {
@@ -383,7 +464,6 @@ ffi::Error Fill(cudaStream_t stream, ffi::Buffer<ffi::U32> prm, ffi::Result<ffi:
             return ffi::Error::InvalidArgument("tandem_fill: kind must be stream, below or normal");
         }
     }
-    if (scratch) cudaFreeAsync(scratch, stream);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(e));
     return ffi::Error::Success();
@@ -394,6 +474,7 @@ ffi::Error Fill(cudaStream_t stream, ffi::Buffer<ffi::U32> prm, ffi::Result<ffi:
 XLA_FFI_DEFINE_HANDLER_SYMBOL(TandemFill, Fill,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::ScratchAllocator>()
                                   .Arg<ffi::Buffer<ffi::U32>>()
                                   .Ret<ffi::AnyBuffer>()
                                   .Attr<int64_t>("n")

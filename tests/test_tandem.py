@@ -656,6 +656,8 @@ def test_cuda_kernels_batch_under_vmap():
     for f in (
         lambda k, p: tj.stream(k, p, 1001, jnp.float32)[0],
         lambda k, p: tj.stream_normal(k, p, 1001, jnp.float64)[0],
+        # Even and odd rows of the two-kernel path in one launch.
+        lambda k, p: tj.stream_normal(k, p, 70001, jnp.float64)[0],
         lambda k, p: tj.stream_randint(k, p, 1001, -3, 2**31 + 1, jnp.int64)[0],
     ):
         batched = np.array(jax.jit(jax.vmap(f))(keys, pos))
