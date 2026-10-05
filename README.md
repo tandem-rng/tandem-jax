@@ -105,7 +105,7 @@ column has the extension installed, which splits each fill over XLA's thread poo
 | uniform float32 | 5.2 | 94 | 3.0 |
 | uniform float64 | 4.8 | 102 | 5.5 |
 | normal float32 | 3.6 | 23 | 2.6 |
-| normal float64 | 3.3 | 21 | 3.0 |
+| normal float64 | 1.2 | 26 | 3.0 |
 | randint int32 in [0, 1000) | 3.0 | 47 | 1.7 |
 | randint int64 in [0, 1000) | 5.3 | 88 | 3.0 |
 
@@ -117,13 +117,13 @@ best of seven runs, GiB/s of output. `jax.random` uses the default threefry2x32 
 | uniform float32 | 24 | 730 | 523 |
 | uniform float64 | 24 | 1125 | 973 |
 | normal float32 | 24 | 841 | 418 |
-| normal float64 | 24 | 706 | 222 |
+| normal float64 | 24 | 468 | 226 |
 | randint int32 in [0, 1000) | 24 | 919 | 298 |
 | randint int64 in [0, 1000) | 24 | 1041 | 537 |
 | uniform float32 | 27 | 1304 | 656 |
 | uniform float64 | 27 | 1345 | 991 |
 | normal float32 | 27 | 1193 | 427 |
-| normal float64 | 27 | 740 | 226 |
+| normal float64 | 27 | 953 | 220 |
 | randint int32 in [0, 1000) | 27 | 1216 | 329 |
 | randint int64 in [0, 1000) | 27 | 1277 | 567 |
 
