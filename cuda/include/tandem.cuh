@@ -23,7 +23,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <type_traits>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -273,6 +275,8 @@ __device__ __forceinline__ void store_tile_widened(const uint4 *tile, unsigned s
                                                    uint32_t K, uint32_t jb, uint64_t b0,
                                                    uint64_t b1, const Ctx &x,
                                                    typename elem<E>::out_t *out) {
+    /* Each 8-byte half slot holds two draws, so other draw widths would store part of the block. */
+    static_assert(elem<E>::bits == 32, "the widened tile store needs 32-bit draws");
     using out_t = typename elem<E>::out_t;
     constexpr unsigned size = elem<E>::bits / 8, per_tile_group = TILE_STEPS * 8;
     const uint2 *half = reinterpret_cast<const uint2 *>(tile);
@@ -564,6 +568,136 @@ __global__ void __launch_bounds__(THREADS)
         if (base + i < cap) list[base + i] = q[i];
 }
 
+/* The two fast-path values of one block. */
+struct NormalPair {
+    double v[2];
+};
+
+/* The table pass in octets, as tandem-sycl's normal64_octet_body, for the starts whose stores
+ * above would sit 16 bytes off the 32-byte sectors: each group and step then touches five sectors
+ * instead of four, which cost the A100 a third of its speed at word 6. Each thread takes the fast
+ * path of its own block's two draws and queues their misses. The fill is cut into units of two
+ * elements from its first draw d0: unit u is 16 output bytes at element 2u and starts at draw
+ * KD = d0 % 2 of block B0 + u, B0 = d0 / 2. Lane l of a group writes unit 8m + l of octet m, so
+ * the eight lanes write 128 aligned bytes. With d = B0 % 8 the octet's units start in row R from
+ * lane d on and in row R + 1 below lane d, so a group writes the octet of row R when row R + 1 is
+ * out, taking the values from the lanes that hold them by warp shuffles, and stores it one step
+ * later still, so that the store does not wait for the next step's table reads. */
+template <unsigned KD>
+__global__ void __launch_bounds__(THREADS)
+    fill_normal64_octets(uint32_t key0, uint32_t key1, uint32_t key2, uint32_t key3, uint32_t K,
+                         uint64_t g0, uint64_t d0, uint64_t n, double *out, NormalMiss *list,
+                         unsigned long long *count, uint64_t cap) {
+    constexpr unsigned GROUPS = THREADS / 8;
+    __shared__ NormalMiss q[NORMAL_QUEUE];
+    __shared__ unsigned nq;
+    __shared__ unsigned long long base;
+    /* Each group's first row, and the first row of the group after the block. */
+    __shared__ NormalPair first[THREADS + 8];
+    const uint32_t key[4] = {key0, key1, key2, key3};
+    const unsigned rank = threadIdx.x, gi = rank >> 3, lane = rank & 7u, w0 = (rank & 31u) - lane;
+    const uint64_t gb = g0 + blockIdx.x * (uint64_t)GROUPS, g = gb + gi;
+    const uint64_t units = (n + 1u) / 2u, B0 = d0 >> 1, R0 = B0 >> 3, r1 = ((d0 + n - 1u) >> 1) >> 3;
+    const bool mine = g <= r1 / K;
+    const unsigned d = (unsigned)(B0 & 7u);
+    /* The lanes of this lane's unit's first and second block, and whether each lies in R + 1. */
+    const unsigned la = (d + lane) & 7u, lb = (d + lane + 1u) & 7u;
+    const bool na = d + lane >= 8u, nb = d + lane + 1u >= 8u;
+    if (rank == 0) nq = 0;
+    uint32_t o[4], h[4];
+    F_keyed(key, 8u * g + lane, DOMAIN_STREAM, AUX_STREAM, o, h);
+    if (rank < 8u) {
+        uint32_t w[4];
+        block(key, 8u * (gb + GROUPS) + rank, 0, w);
+        bool hit;
+        first[THREADS + rank].v[0] = normal_f64_fast(w[0] | ((uint64_t)w[1] << 32), hit);
+        first[THREADS + rank].v[1] = normal_f64_fast(w[2] | ((uint64_t)w[3] << 32), hit);
+    }
+    __syncthreads();
+
+    auto push = [&](uint64_t e, uint64_t r) {
+        unsigned s = atomicAdd(&nq, 1u);
+        if (s < NORMAL_QUEUE) {
+            q[s] = NormalMiss{e, r};
+        } else {
+            unsigned long long t = atomicAdd(count, 1ull);
+            if (t < cap) list[t] = NormalMiss{e, r};
+        }
+    };
+    /* Step j of this thread's chunk: the fast path of its block, its misses queued. */
+    auto step = [&](uint32_t j, NormalPair &x) {
+        if (!mine) return;
+        T(o, h);
+        const uint64_t dr = 2u * ((g * K + j) * 8u + lane); /* the block's first draw */
+        for (unsigned k = 0; k < 2; k++) {
+            const uint64_t r = o[2 * k] | ((uint64_t)o[2 * k + 1] << 32);
+            bool hit;
+            x.v[k] = normal_f64_fast(r, hit);
+            if (__builtin_expect(!hit, 0) && dr + k >= d0 && dr + k < d0 + n) push(dr + k - d0, r);
+        }
+    };
+    /* Unit 8 (R - R0) + lane: element t is value (t + KD) % 2 of its first block (t + KD < 2)
+     * or of its second, from row R + 1 (late) or row R (early). */
+    auto emit = [&](uint64_t R, const NormalPair &late, const NormalPair &early) {
+        if (!mine || R < R0 || 8u * (R - R0) + lane >= units) return;
+        const uint64_t e = 2u * (8u * (R - R0) + lane);
+        double z[2];
+        for (unsigned t = 0; t < 2; t++) {
+            const unsigned k = (t + KD) & 1u;
+            z[t] = (t + KD < 2u ? na : nb) ? late.v[k] : early.v[k];
+        }
+        if (e + 2u <= n) {
+            *reinterpret_cast<double2 *>(out + e) = make_double2(z[0], z[1]);
+        } else {
+            for (unsigned t = 0; t < 2; t++)
+                if (e + t < n) out[e + t] = z[t];
+        }
+    };
+    /* Value k of the block of lane la (k >= KD) or lb (k < KD). Every thread of the warp calls
+     * it. */
+    auto fetch = [&](const NormalPair &own, NormalPair &x) {
+        for (unsigned k = 0; k < 2; k++)
+            x.v[k] = __shfl_sync(0xffffffffu, own.v[k], w0 + (k + 1u > KD ? la : lb));
+    };
+    /* Whether step j has a row in the fill, the same for the whole block. */
+    auto live = [&](uint32_t j) { return j < K && gb * K + j <= r1; };
+    NormalPair own{{0.0, 0.0}}, prev{{0.0, 0.0}}, cur{{0.0, 0.0}};
+    uint32_t j = 0;
+    if (live(0)) {
+        step(0, own);
+        first[gi * 8u + lane] = own;
+        fetch(own, prev);
+        if (live(1)) {
+            step(1, own);
+            fetch(own, cur);
+            for (j = 2; live(j); j++) {
+                emit(g * K + j - 2u, cur, prev);
+                prev = cur;
+                step(j, own);
+                fetch(own, cur);
+            }
+            emit(g * K + j - 2u, cur, prev);
+            prev = cur;
+        } else {
+            j = 1;
+        }
+    }
+    /* The octet of the last row stepped. Its row R + 1 is the next group's first row after a
+     * whole group, and after a loop cut short lies past the fill, so the units that need it are
+     * past the fill too. */
+    __syncthreads();
+    const NormalPair *next = first + (gi + 1u) * 8u;
+    for (unsigned k = 0; k < 2; k++) cur.v[k] = next[k + 1u > KD ? la : lb].v[k];
+    if (j > 0) emit(g * K + j - 1u, cur, prev);
+    __syncthreads();
+    unsigned m = nq < NORMAL_QUEUE ? nq : NORMAL_QUEUE;
+    if (m == 0) return;
+    if (threadIdx.x == 0) base = atomicAdd(count, (unsigned long long)m);
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < m; i += THREADS)
+        if (base + i < cap) list[base + i] = q[i];
+}
+
 /* The misses of the list, or of the whole fill when the list overflowed. */
 __global__ void __launch_bounds__(THREADS)
     fill_normal64_misses(uint32_t key0, uint32_t key1, uint32_t key2, uint32_t key3, uint32_t K,
@@ -593,8 +727,8 @@ __global__ void __launch_bounds__(THREADS)
     }
 }
 
-/* Short fills, and fills without the stream-ordered allocator, in one kernel that continues each
- * miss where it finds it. */
+/* Short fills, and fills that get no miss list, in one kernel that continues each miss where it
+ * finds it. */
 __global__ void __launch_bounds__(THREADS)
     fill_normal64_fused(uint32_t key0, uint32_t key1, uint32_t key2, uint32_t key3, uint32_t K,
                         uint64_t g0, uint64_t d0, uint64_t n, double *out) {
@@ -608,6 +742,55 @@ __global__ void __launch_bounds__(THREADS)
     });
 }
 
+/* Miss lists kept between fills, per device. A fill takes a list whose last fill is done, or one
+ * last used on its own stream, which it waits for in stream order, else it allocates one. So
+ * lists grow to the number of streams that fill at once, and live to the end of the program: the
+ * CUDA runtime may be gone when static destructors run. */
+struct NormalScratch {
+    void *p;
+    size_t bytes;
+    int device;
+    cudaStream_t stream; /* of the last fill */
+    cudaEvent_t done;    /* recorded after the last fill */
+};
+
+inline std::mutex &normal_scratch_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+/* A list of at least `bytes` on the current device for a fill on `stream`, or null. The caller
+ * holds the mutex, waits for `done` on the stream and records it after the fill. */
+inline NormalScratch *normal_scratch(size_t bytes, cudaStream_t stream) {
+    static auto *all = new std::vector<NormalScratch *>();
+    int dev;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    NormalScratch *same = nullptr;
+    for (NormalScratch *s : *all) {
+        if (s->device != dev || s->bytes < bytes) continue;
+        if (cudaEventQuery(s->done) == cudaSuccess) return s;
+        if (s->stream == stream) same = s;
+    }
+    (void)cudaGetLastError();
+    if (same) return same;
+    size_t b = 1;
+    while (b < bytes) b <<= 1;
+    auto *s = new NormalScratch{nullptr, b, dev, stream, nullptr};
+    if (cudaMalloc(&s->p, b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        delete s;
+        return nullptr;
+    }
+    if (cudaEventCreateWithFlags(&s->done, cudaEventDisableTiming) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(s->p);
+        delete s;
+        return nullptr;
+    }
+    all->push_back(s);
+    return s;
+}
+
 /* Fills below this length take the fused kernel and allocate nothing. */
 constexpr size_t NORMAL_LIST_MIN = (size_t)1 << 16;
 
@@ -619,12 +802,27 @@ inline uint64_t fill_normal_f64_impl(const uint32_t key[4], uint64_t pos, uint32
     uint64_t d0 = p0 >> 6, ba = d0 >> 1, bb = (d0 + n - 1u) >> 1;
     uint64_t g0 = (ba >> 3) / K, g1 = (bb >> 3) / K, chunks = 8u * (g1 - g0 + 1u);
     unsigned blocks = (unsigned)((chunks + THREADS - 1) / THREADS);
-    /* Room for twice the expected misses. The stream-ordered allocator reuses the memory of the
-     * last fill. */
+    /* Room for twice the expected misses, in a list kept between fills. The default pool of the
+     * stream-ordered allocator returns its memory at every synchronize, after which a fresh list
+     * cost about 0.7 ms on the host. A fill captured into a graph takes its list from that
+     * allocator, so that each launch of the graph has its own. */
     uint64_t cap = n / 128u;
+    const size_t bytes = 16 + cap * sizeof(NormalMiss);
     void *scratch = nullptr;
-    if (n < NORMAL_LIST_MIN ||
-        cudaMallocAsync(&scratch, 16 + cap * sizeof(NormalMiss), stream) != cudaSuccess) {
+    NormalScratch *kept = nullptr;
+    std::unique_lock<std::mutex> lock(normal_scratch_mutex(), std::defer_lock);
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (n >= NORMAL_LIST_MIN) {
+        (void)cudaStreamIsCapturing(stream, &capture);
+        if (capture == cudaStreamCaptureStatusNone) {
+            lock.lock();
+            kept = normal_scratch(bytes, stream);
+            if (kept && cudaStreamWaitEvent(stream, kept->done, 0) == cudaSuccess) scratch = kept->p;
+        } else if (cudaMallocAsync(&scratch, bytes, stream) != cudaSuccess) {
+            scratch = nullptr;
+        }
+    }
+    if (!scratch) {
         (void)cudaGetLastError();
         fill_normal64_fused<<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3], K, g0,
                                                             d0, n, out);
@@ -633,7 +831,18 @@ inline uint64_t fill_normal_f64_impl(const uint32_t key[4], uint64_t pos, uint32
     auto count = static_cast<unsigned long long *>(scratch);
     auto list = reinterpret_cast<NormalMiss *>(static_cast<char *>(scratch) + 16);
     cudaMemsetAsync(count, 0, sizeof *count, stream);
-    if (((reinterpret_cast<uintptr_t>(out) - 8u * d0) & 15u) == 0)
+    /* Where the stream's rows start in the output's 32-byte sectors. The kernel above writes
+     * whole sectors when they start on one (even draws) or 8 bytes before one (odd draws, whose
+     * stores begin a draw later). The octets need a 32-byte aligned output. */
+    const uintptr_t off = (reinterpret_cast<uintptr_t>(out) - 8u * d0) & 31u;
+    if ((reinterpret_cast<uintptr_t>(out) & 31u) == 0 && (off == 8u || off == 16u)) {
+        if (d0 & 1u)
+            fill_normal64_octets<1><<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3], K,
+                                                                    g0, d0, n, out, list, count, cap);
+        else
+            fill_normal64_octets<0><<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3], K,
+                                                                    g0, d0, n, out, list, count, cap);
+    } else if ((off & 15u) == 0)
         fill_normal64_kernel<false><<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3],
                                                                     K, g0, d0, n, out, list, count, cap);
     else
@@ -643,14 +852,21 @@ inline uint64_t fill_normal_f64_impl(const uint32_t key[4], uint64_t pos, uint32
     unsigned mblocks = (unsigned)((n / 200u + THREADS - 1) / THREADS);
     fill_normal64_misses<<<mblocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3], K, g0,
                                                           chunks, d0, n, list, count, cap, out);
-    cudaFreeAsync(scratch, stream);
+    if (kept) {
+        cudaEventRecord(kept->done, stream);
+        kept->stream = stream;
+    } else {
+        cudaFreeAsync(scratch, stream);
+    }
     return p0 + 64u * (uint64_t)n;
 }
 
 /* The float Box-Muller step of the fill kernel. It is box_muller2_f32 with the angle through
  * the fast __sincosf, which with precise logf and sqrtf makes the fill memory bound instead of
  * compute bound. __sincosf is accurate only on [-pi, pi], so the angle is shifted by half a turn.
- * The result stays within 16 ulps + 1e-6 of the precise step (measured at most 1.5e-6 absolute).
+ * The result stays within 16 ulps + 2.1e-6 of the precise step: __sincosf errs by up to
+ * 2^-21.41 absolute, times a radius of up to 5.77. About one value in 10^6 passes the spec's 1e-6
+ * floor. The precise sincospif, or the reference polynomials, make the fill compute bound.
  * Define TANDEM_PRECISE_F32_NORMAL for sincospif. __logf is not used: its absolute error near
  * 1 distorts small radii by thousands of ulps. */
 __device__ __forceinline__ Pair2<float> normal_step_f32(float a, float b) {

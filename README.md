@@ -13,7 +13,7 @@ kernels from [tandem-cuda](https://github.com/tandem-rng/tandem-cuda) on NVIDIA 
 stream the specification defines, bit for bit, fast on CPU and GPU.
 
 Needs Python 3.11 and `jax>=0.10`. `cpu/tandem` is tandem-c commit `121db59`. The headers in
-`cuda/include` are tandem-cuda commit `76eddae`.
+`cuda/include` are tandem-cuda commit `bab9870`.
 
 ```sh
 pip install .
