@@ -52,5 +52,12 @@ the fallback stream `split(g)` of `sub(0x4e524d3634)`, with `g` the index of the
 key's stream. XLA fuses a product into the sum that reads it, so the XLA path emulates the
 reference logarithm's fused multiply-adds exactly and keeps every other product out of a sum.
 
+The XLA path writes each miss as NaN and packs the misses into 32-bit words. A binary search over
+the running count of the words then finds miss `k`, where `nonzero` over the fill took longer
+than the fill. The slow path takes a batch of the expected misses plus six standard deviations,
+and more misses take further batches. Two of its rounds settle all but a few dozen misses, and
+the rest finish on a gathered set of 256. XLA fuses an unrolled F into each consumer of its
+eight words, so the slow path runs F as a loop.
+
 `float32` normals are Box-Muller pairs: elements `2j` and `2j + 1` are `r cos 2 pi b` and
 `r sin 2 pi b` from uniform draws `2j` and `2j + 1`, computed in `float32` in one fused `jit`.

@@ -21,6 +21,8 @@ pixi run test     # tests/test_tandem.py
   `121db59` (rows with wedge, redraw and tail misses) and tandem-cuda's
   `tests/cross_fill_normal.h` at `76eddae`,
 - checks the ziggurat tables against the spec file's SHA-256,
+- checks that the XLA path's `float64` normals keep their values when the misses run in batches
+  of one or three, or finish on a gathered set of one or four,
 - checks fork children at traced positions, and split children for indices up to 2^64 - 1
   against a direct evaluation of F,
 - checks normal moments to fourth order and a KS test on 10^7 draws, and chi-square uniformity
