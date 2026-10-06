@@ -7,7 +7,7 @@ pixi run test     # tests/test_tandem.py and tests/test_conformance.py
 ## Suite
 
 `tests/test_conformance.py` reads `tests/conformance`, copies of the spec's `conformance/*.json`
-at commit `f420545`, and checks every item of the spec's `conformance/CHECKLIST.md`, on the native
+at commit `f420545`, and checks every item of the spec's `conformance/CHECKLIST.md` at b31af72, on the native
 fills and on the XLA path:
 
 - every bounded, normal, exponential and weighted choice case, values and end positions, whole,

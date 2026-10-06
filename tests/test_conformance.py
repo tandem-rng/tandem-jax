@@ -1,5 +1,5 @@
 """The spec's conformance files, copies of tandem-spec f420545 conformance/*.json that CI checks
-byte for byte, and every item of its conformance/CHECKLIST.md."""
+byte for byte, and every item of its conformance/CHECKLIST.md at b31af72."""
 
 import functools
 import hashlib
