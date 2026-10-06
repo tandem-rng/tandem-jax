@@ -11,8 +11,8 @@ at commit `f420545`, and checks every item of the spec's `conformance/CHECKLIST.
 fills and on the XLA path:
 
 - every bounded, normal, exponential and weighted choice case, values and end positions, whole,
-  cut at elements 1, 7, 20, 21 and `n - 1` (even ones for `float32` normals), and one element at
-  a time,
+  cut at elements 1, 7, 20, 21 and `n - 1` (2, 8, 20 and the last even element for `float32`
+  normals), and one element at a time,
 - the scalar bounded cases, by Lemire's loop over the port's plain draws,
 - the fallback index of rejected and missed draws, the width that follows the range, the empty
   fills, odd `n` and the pairs of the `float32` normals,

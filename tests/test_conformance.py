@@ -88,14 +88,14 @@ def path(request, monkeypatch):
 
 
 def test_fill_cases_whole_cut_and_one_element_at_a_time(path):
-    # Cuts of a Float32 normal fill fall between pairs, since an odd piece consumes its whole pair.
+    # Float32 normal fills are cut at pair boundaries only, as the checklist says.
     assert len(FILLS) == 133 and sum(c["n"] == 0 for c in FILLS) == 7
     for c in FILLS:
         k, f, n = key(c), fill(c), c["n"]
         got, pos = f(k, c["start"], n)
         assert same(got, c) and int(pos) == end(c), c["id"]
-        step = 2 if c["kind"] == "fill_normal_f32" else 1
-        for cut in sorted({x for x in (1, 7, 20, 21, n - 1) if 0 < x < n and x % step == 0}):
+        cuts = (2, 8, 20, (n - 1) & ~1) if c["kind"] == "fill_normal_f32" else (1, 7, 20, 21, n - 1)
+        for cut in sorted({x for x in cuts if 0 < x < n}):
             head, mid = f(k, c["start"], cut)
             tail, pos = f(k, mid, n - cut)
             assert same(np.concatenate([head, tail]), c) and int(pos) == end(c), (c["id"], cut)
