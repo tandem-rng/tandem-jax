@@ -49,7 +49,7 @@ pip install --no-build-isolation ./cuda
 The build targets every major GPU architecture. Add
 `-C cmake.define.CMAKE_CUDA_ARCHITECTURES=80` (an A100, for example) to build for one only.
 
-The headers in `cuda/include` are those of tandem-cuda commit `bab9870`. The `float64` normal
+The headers in `cuda/include` are those of tandem-cuda commit `2693c63`. The `float64` normal
 kernels in `cuda/tandem_ffi.cu` follow those of commit `0ff5f18`: the octet table pass of `3aac1fb`
 changes speed only, and XLA's scratch allocator already keeps the miss lists.
 

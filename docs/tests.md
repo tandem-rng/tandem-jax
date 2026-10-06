@@ -19,7 +19,7 @@ pixi run test     # tests/test_tandem.py
 - compares positioned reads and `jax.random.bits` with reference stream dumps in `tests/data`,
 - checks the `float64` normals bit for bit against tandem-c's `tests/cross_normal.h` at commit
   `121db59` (rows with wedge, redraw and tail misses) and tandem-cuda's
-  `tests/cross_fill_normal.h` at `bab9870`,
+  `tests/cross_fill_normal.h` at `2693c63`,
 - checks `exponential` in `float64` and `float32` bit for bit against tandem-c's
   `tests/cross_exponential.h`, on the native fills and on the XLA path,
 - checks the ziggurat tables against the spec file's SHA-256,

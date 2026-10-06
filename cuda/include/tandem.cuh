@@ -873,7 +873,7 @@ __device__ __forceinline__ Pair2<float> normal_step_f32(float a, float b) {
 #if defined(TANDEM_PRECISE_F32_NORMAL)
     return box_muller2_f32(a, b);
 #else
-    float r = sqrtf(-2.0f * logf(1.0f - a)), s, c;
+    float r = detail::sqrt_rn_nonneg(-2.0f * logf(1.0f - a)), s, c;
     __sincosf(6.2831853071795864769f * (b - 0.5f), &s, &c);
     return Pair2<float>{-r * c, -r * s};
 #endif

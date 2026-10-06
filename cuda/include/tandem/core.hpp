@@ -364,6 +364,22 @@ inline float sqrt_(float x) { return __builtin_elementwise_sqrt(x); }
 #else
 TANDEM_FN float sqrt_(float x) { return std::sqrt(x); }
 #endif
+/* The IEEE square root of x = 0 or 2^-101 <= x < infinity. On a device it is the fast path of the
+ * IEEE square root without its range check and slow path, which only zero, tiny, infinite and
+ * negative inputs need, and zero keeps its sign. tests/test_cuda.cu checks it against __fsqrt_rn
+ * for the radius of every Float32 draw. */
+TANDEM_FN float sqrt_rn_nonneg(float x) {
+#if defined(__CUDA_ARCH__)
+    float r, s, h;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    asm("mul.ftz.f32 %0, %1, %2;" : "=f"(s) : "f"(x), "f"(r));
+    asm("mul.ftz.f32 %0, %1, 0f3F000000;" : "=f"(h) : "f"(r));
+    float y = __fmaf_rn(__fmaf_rn(-s, s, x), h, s);
+    return x > 0.0f ? y : x;
+#else
+    return std::sqrt(x);
+#endif
+}
 /* Every multiply-add of the normal loops is an explicit fused multiply-add, so that every
  * compiler and target gives the same bits, as in tandem-c. Without a fused instruction std::fma
  * is a correct but slow library call that cannot vectorize: build with -mfma on x86. */
@@ -456,7 +472,7 @@ TANDEM_NOINLINE_NOFMA inline void normal_block_f32(const float *__restrict u,
 /* The same in float: on a device precise logf and sincospif, on a host normal_block_f32. */
 TANDEM_FN Pair2<float> box_muller2_f32(float a, float b) {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    float r = std::sqrt(-2.0f * std::log(1.0f - a)), s, c;
+    float r = detail::sqrt_rn_nonneg(-2.0f * std::log(1.0f - a)), s, c;
     sincospif(2.0f * b, &s, &c);
     return Pair2<float>{r * c, r * s};
 #else
@@ -469,7 +485,7 @@ TANDEM_FN Pair2<float> box_muller2_f32(float a, float b) {
 /* The cos half alone: Box-Muller from two draws a and b in [0, 1), u = 1 - a in (0, 1]. */
 TANDEM_FN float box_muller_f32(float a, float b) {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    return std::sqrt(-2.0f * std::log(1.0f - a)) * std::cos(2.0f * 3.14159265358979323846f * b);
+    return detail::sqrt_rn_nonneg(-2.0f * std::log(1.0f - a)) * std::cos(2.0f * 3.14159265358979323846f * b);
 #else
     return box_muller2_f32(a, b).z0;
 #endif
@@ -481,31 +497,56 @@ namespace detail {
  * L = -2 k ln 2 - 4 s p(s^2) with s = (m - 1) / (m + 1). Every multiply-add is an explicit fma
  * and no plain product feeds a plain sum, so contraction cannot change the bits, and every host
  * and device returns tandem-c's values. A device build with -use_fast_math or -prec-div=false
- * rounds the division differently. */
-TANDEM_FN double neg2_log_f64(double x) {
+ * rounds the division differently.
+ *
+ * neg_log_f64 returns L(x) / 2 = -ln x with the factors -4 and 1/2 moved into the operands:
+ * t = (2 - 2m) / (m + 1) = -2 s, t^2 = 4 s^2, the coefficient of s^(2j) over 4^j, and the ln 2
+ * terms halved. Scaling by a power of two commutes with rounding while nothing is subnormal, so
+ * every operation rounds to the reference's value times a power of two, and the result has the
+ * bits of L(x) / 2 with two multiplications fewer. The f64 pipes bound the exponential fills on
+ * GPUs. */
+TANDEM_FN double neg_log_f64(double x) {
     uint64_t ix = f64_bits(x) + 0x00095f6200000000u;
     double nk = (double)(1023 - (int32_t)(ix >> 52)); /* -k */
     double mant = f64_from_bits((ix & 0x000fffffffffffffu) + 0x3fe6a09e00000000u);
-    double s = (mant - 1.0) / (mant + 1.0), zz = s * s;
-    double p = fmad(zz, fmad(zz, fmad(zz, fmad(zz, fmad(zz, fmad(zz, 0.08312363319426472,
-               0.09070001083303751), 0.11111433317907482), 0.14285712049336274),
-               0.2000000000566491), 0.33333333333331017), 1.0);
-    return fmad(nk, 3.816429394731813e-10, fmad(nk, 1.3862943607382476, (s * -4.0) * p));
+    double t = fmad(mant, -2.0, 2.0) / (mant + 1.0), z4 = t * t;
+    double p = fmad(z4, fmad(z4, fmad(z4, fmad(z4, fmad(z4, fmad(z4, 0.08312363319426472 / 4096,
+               0.09070001083303751 / 1024), 0.11111433317907482 / 256), 0.14285712049336274 / 64),
+               0.2000000000566491 / 16), 0.33333333333331017 / 4), 1.0);
+    return fmad(nk, 3.816429394731813e-10 / 2, fmad(nk, 1.3862943607382476 / 2, t * p));
+}
+TANDEM_FN double neg2_log_f64(double x) { return 2.0 * neg_log_f64(x); }
+
+/* n / d rounded to nearest for a normal or zero n, d in [1, 4) and a normal or zero quotient: the fast
+ * path of the device's IEEE division without its range check and slow path, which cost the f32
+ * exponential fill 11 % on the A100. Every Float32 draw gives exponential_f32's bits, which
+ * tests/test_cuda.cu checks for all 2^24 draws. */
+TANDEM_FN float div_rn_unit(float n, float d) {
+#if defined(__CUDA_ARCH__)
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
+    r = __fmaf_rn(r, __fmaf_rn(-d, r, 1.0f), r);
+    float q = __fmul_rn(n, r);
+    return __fmaf_rn(r, __fmaf_rn(-d, q, n), q);
+#else
+    return n / d;
+#endif
 }
 } // namespace detail
 
 /* Standard exponential -ln(1 - u) of a uniform u (spec Appendix A), on a host and on a device:
  * L(1 - u) / 2 with the reference logarithm, where 1 - u and the halving are exact. */
-TANDEM_FN double exponential_f64(double u) { return 0.5 * detail::neg2_log_f64(1.0 - u); }
+TANDEM_FN double exponential_f64(double u) { return detail::neg_log_f64(1.0 - u); }
 
+/* The f32 logarithm with the factors folded in as in neg_log_f64. */
 TANDEM_FN float exponential_f32(float u) {
     using detail::fmaf_;
     uint32_t ix = detail::f32_bits(1.0f - u) + 0x004afb0du;
     float nk = (float)(127 - (int32_t)(ix >> 23)); /* -k */
     float mant = detail::f32_from_bits((ix & 0x007fffffu) + 0x3f3504f3u);
-    float s = (mant - 1.0f) / (mant + 1.0f), zz = s * s;
-    float p = fmaf_(zz, fmaf_(zz, fmaf_(zz, 0.14275366f, 0.20000061f), 0.33333334f), 1.0f);
-    return 0.5f * fmaf_(nk, 2.857213530660374e-06f, fmaf_(nk, 1.38629150390625f, (s * -4.0f) * p));
+    float t = detail::div_rn_unit(fmaf_(mant, -2.0f, 2.0f), mant + 1.0f), z4 = t * t;
+    float p = fmaf_(z4, fmaf_(z4, fmaf_(z4, 0.14275366f / 64, 0.20000061f / 16), 0.33333334f / 4), 1.0f);
+    return fmaf_(nk, 2.857213530660374e-06f / 2, fmaf_(nk, 1.38629150390625f / 2, t * p));
 }
 
 TANDEM_FN bool operator==(const Key &a, const Key &b) {
@@ -844,7 +885,7 @@ TANDEM_COLD TANDEM_FN double normal_f64_slow(uint64_t r, const uint32_t key[4], 
         }
         /* u (Y[i + 1] - Y[i]) >= 0, so the zero addend leaves the product's bits alone. */
         double y = add_rn(zig_y(i), fmad(fb.drand(), zig_y(i + 1) - zig_y(i), 0.0));
-        if (-0.5 * neg2_log_f64(y) < -0.5 * (x * x)) return x;
+        if (-neg_log_f64(y) < -0.5 * (x * x)) return x;
         r = fb.urand64();
         x = normal_f64_fast(r, hit);
         if (hit) return x;
