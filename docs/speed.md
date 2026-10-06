@@ -6,17 +6,25 @@
 ## CPU
 
 Apple M4 Pro, XLA CPU backend, `jax_enable_x64`, `pixi run bench 22`, jitted, minimum of five
-runs after a warm-up, GiB/s of output, 2^22 elements. The `cpu/` column has the extension
-installed, which splits each fill over XLA's thread pool.
+runs after a half-second warm-up, GiB/s of output, 2^22 elements, median of three passes in one
+session. The `cpu/` column has the extension installed, which splits each fill over XLA's thread
+pool.
 
 | draw | tandem_jax | tandem_jax with `cpu/` | threefry |
 |---|---|---|---|
-| uniform float32 | 5.2 | 94 | 3.0 |
-| uniform float64 | 4.8 | 102 | 5.5 |
-| normal float32 | 3.6 | 23 | 2.6 |
-| normal float64 | 3.9 | 26 | 3.0 |
-| randint int32 in [0, 1000) | 3.0 | 47 | 1.7 |
-| randint int64 in [0, 1000) | 5.3 | 88 | 3.0 |
+| uniform float32 | 5.3 | 81 | 2.7 |
+| uniform float64 | 4.4 | 32 | 4.8 |
+| normal float32 | 3.2 | 28 | 2.0 |
+| normal float64 | 3.5 | 25 | 2.2 |
+| exponential float32 | 1.4 | 35 | 2.2 |
+| exponential float64 | 0.98 | 22 | 2.4 |
+| randint int32 in [0, 1000) | 2.8 | 35 | 1.4 |
+| randint int64 in [0, 1000) | 4.8 | 28 | 2.4 |
+
+The XLA path costs the same per 32-bit word at every width: its `float64` uniforms run at the
+rate of 2n `uint32` words. Threefry hashes once per element and returns 64 bits for `float64`, so
+it leads there and Tandem leads at `float32`. Without the extension the exponentials trail
+threefry too.
 
 With `cpu/` built to fill in one part, the uniforms ran at 16.0 (`float32`) and 16.6 (`float64`)
 GiB/s against 16.6 and 16.1 for tandem-c's own fills in the same window, and the `float32` normals
