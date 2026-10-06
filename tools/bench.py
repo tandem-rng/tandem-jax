@@ -12,11 +12,16 @@ dominate the time.
     python tools/bench.py [log2 sizes, default 24 27]
 """
 
+import os
 import subprocess
 import sys
 import time
 
-import jax
+# The parent only spawns the cells. Without preallocation it leaves them the GPU's memory.
+if sys.argv[1:2] != ["--cell"]:
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+import jax  # noqa: E402
 
 jax.config.update("jax_enable_x64", True)
 

@@ -39,25 +39,30 @@ two thirds of that time and the misses the rest.
 
 ## GPU
 
-NVIDIA A100 (one GPU of two, idle), CUDA 12 `jaxlib` 0.11.2 with driver 570, `jax_enable_x64`,
-the CUDA kernels built for `sm_80`, `python tools/bench.py`. Each function is jitted and warmed
-up for half a second, a run times ten calls issued back to back, and the table gives the best of
-seven runs in GiB/s of output.
+NVIDIA A100 (GPU 1 of two, idle), CUDA 12 `jaxlib` 0.11.2 with driver 570, `jax_enable_x64`,
+the CUDA kernels built for `sm_80`, `python tools/bench.py`, one session. Each cell runs in its
+own process. Each function is jitted and warmed up for half a second, a run times ten calls
+issued back to back, and the table gives the best of seven runs in GiB/s of output. The XLA
+path column is tandem_jax without the extension.
 
-| draw | log2 n | tandem_jax | threefry |
-|---|---|---|---|
-| uniform float32 | 24 | 730 | 523 |
-| uniform float64 | 24 | 1125 | 973 |
-| normal float32 | 24 | 841 | 418 |
-| normal float64 | 24 | 768 | 226 |
-| randint int32 in [0, 1000) | 24 | 919 | 298 |
-| randint int64 in [0, 1000) | 24 | 1041 | 537 |
-| uniform float32 | 27 | 1304 | 656 |
-| uniform float64 | 27 | 1345 | 991 |
-| normal float32 | 27 | 1193 | 427 |
-| normal float64 | 27 | 1036 | 220 |
-| randint int32 in [0, 1000) | 27 | 1216 | 329 |
-| randint int64 in [0, 1000) | 27 | 1277 | 567 |
+| draw | log2 n | tandem_jax | XLA path | threefry |
+|---|---|---|---|---|
+| uniform float32 | 24 | 756 | 87 | 550 |
+| uniform float64 | 24 | 1069 | 121 | 919 |
+| normal float32 | 24 | 594 | 76 | 356 |
+| normal float64 | 24 | 753 | 50 | 226 |
+| exponential float32 | 24 | 575 | 55 | 504 |
+| exponential float64 | 24 | 825 | 63 | 448 |
+| randint int32 in [0, 1000) | 24 | 688 | 54 | 297 |
+| randint int64 in [0, 1000) | 24 | 1025 | 102 | 541 |
+| uniform float32 | 27 | 1300 | 110 | 652 |
+| uniform float64 | 27 | 1347 | 109 | 1016 |
+| normal float32 | 27 | 1201 | 93 | 432 |
+| normal float64 | 27 | 1031 | 72 | 220 |
+| exponential float32 | 27 | 967 | 65 | 533 |
+| exponential float64 | 27 | 884 | 59 | 441 |
+| randint int32 in [0, 1000) | 27 | 1204 | 93 | 334 |
+| randint int64 in [0, 1000) | 27 | 1278 | 156 | 576 |
 
 The kernels alone, as the JAX profiler times them at 2^27, write 1280 to 1390 GiB/s, the rates of
 tandem-cuda's own benchmark. At 2^24 the launch and dispatch cost of each call is a larger share,
@@ -66,7 +71,5 @@ few percent. The `float64` normals are the ziggurat's two kernels, a table pass 
 the misses, as in tandem-cuda, which writes 788 to 825 GiB/s at 2^24. The kernels take the same
 time here. The miss list comes from XLA's scratch allocator. A stream-ordered allocation in each
 call held 2^24 at 468 GiB/s, because XLA's event syncs let the pool release the list between calls.
-Without the extension a GPU runs the XLA path, at 93 to 158 GiB/s for these draws at 2^27. Its
-`float64` normals write 70 GiB/s at 2^27 and 45 at 2^24, against 45 and 41 before the XLA path
-found its misses by a binary search. Those four figures come from tandem-cuda's steady-state
-method: each fill runs for two seconds, then the median of 21 calls, and two runs agreed within 5 %.
+The XLA path's `float64` normals wrote 45 and 41 GiB/s at 2^27 and 2^24 before it found its misses
+by a binary search.
