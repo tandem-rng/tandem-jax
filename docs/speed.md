@@ -43,33 +43,39 @@ NVIDIA A100 (GPU 1 of two, idle), CUDA 12 `jaxlib` 0.11.2 with driver 570, `jax_
 the CUDA kernels built for `sm_80`, `python tools/bench.py`, one session. Each cell runs in its
 own process. Each function is jitted and warmed up for half a second, a run times ten calls
 issued back to back, and the table gives the best of seven runs in GiB/s of output. The XLA
-path column is tandem_jax without the extension.
+path column is tandem_jax without the extension. The cuRAND column is Philox4x32-10 of cuRAND
+10.3.9 in the same session, by the same method, through its host API on a JAX buffer. cuRAND has
+no exponentials and no bounded or 64-bit integer output, so those rows give the nearest call,
+marked "nearest": the uniform the exponential reads, or `curandGenerate` into the same bytes.
 
-| draw | log2 n | tandem_jax | XLA path | threefry |
-|---|---|---|---|---|
-| uniform float32 | 24 | 756 | 87 | 550 |
-| uniform float64 | 24 | 1069 | 121 | 919 |
-| normal float32 | 24 | 594 | 76 | 356 |
-| normal float64 | 24 | 753 | 50 | 226 |
-| exponential float32 | 24 | 575 | 55 | 504 |
-| exponential float64 | 24 | 825 | 63 | 448 |
-| randint int32 in [0, 1000) | 24 | 688 | 54 | 297 |
-| randint int64 in [0, 1000) | 24 | 1025 | 102 | 541 |
-| uniform float32 | 27 | 1300 | 110 | 652 |
-| uniform float64 | 27 | 1347 | 109 | 1016 |
-| normal float32 | 27 | 1201 | 93 | 432 |
-| normal float64 | 27 | 1031 | 72 | 220 |
-| exponential float32 | 27 | 967 | 65 | 533 |
-| exponential float64 | 27 | 884 | 59 | 441 |
-| randint int32 in [0, 1000) | 27 | 1204 | 93 | 334 |
-| randint int64 in [0, 1000) | 27 | 1278 | 156 | 576 |
+| draw | log2 n | tandem_jax | XLA path | threefry | cuRAND Philox4x32-10 | cuRAND call |
+|---|---|---|---|---|---|---|
+| uniform float32 | 24 | 762 | 87 | 526 | 1159 | `curandGenerateUniform` |
+| uniform float64 | 24 | 1078 | 121 | 990 | 794 | `curandGenerateUniformDouble` |
+| normal float32 | 24 | 629 | 76 | 414 | 857 | `curandGenerateNormal` |
+| normal float64 | 24 | 753 | 50 | 232 | 566 | `curandGenerateNormalDouble` |
+| exponential float32 | 24 | 640 | 54 | 414 | 1147 | `curandGenerateUniform`, nearest |
+| exponential float64 | 24 | 819 | 63 | 446 | 798 | `curandGenerateUniformDouble`, nearest |
+| randint int32 in [0, 1000) | 24 | 611 | 53 | 307 | 1159 | `curandGenerate`, nearest |
+| randint int64 in [0, 1000) | 24 | 999 | 101 | 537 | 1245 | `curandGenerate`, nearest |
+| uniform float32 | 27 | 1303 | 110 | 653 | 1275 | `curandGenerateUniform` |
+| uniform float64 | 27 | 1353 | 109 | 1032 | 804 | `curandGenerateUniformDouble` |
+| normal float32 | 27 | 1208 | 93 | 432 | 879 | `curandGenerateNormal` |
+| normal float64 | 27 | 1029 | 72 | 220 | 580 | `curandGenerateNormalDouble` |
+| exponential float32 | 27 | 965 | 65 | 522 | 1267 | `curandGenerateUniform`, nearest |
+| exponential float64 | 27 | 888 | 59 | 443 | 803 | `curandGenerateUniformDouble`, nearest |
+| randint int32 in [0, 1000) | 27 | 1216 | 93 | 332 | 1288 | `curandGenerate`, nearest |
+| randint int64 in [0, 1000) | 27 | 1289 | 157 | 571 | 1302 | `curandGenerate`, nearest |
 
 The kernels alone, as the JAX profiler times them at 2^27, write 1280 to 1390 GiB/s, the rates of
-tandem-cuda's own benchmark. At 2^24 the launch and dispatch cost of each call is a larger share,
-and uniform `float32` there ranged from 717 to 984 GiB/s over three runs. The other cells moved by a
-few percent. The `float64` normals are the ziggurat's two kernels, a table pass and a pass over
-the misses, as in tandem-cuda, which writes 788 to 825 GiB/s at 2^24. The kernels take the same
-time here. The miss list comes from XLA's scratch allocator. A stream-ordered allocation in each
-call held 2^24 at 468 GiB/s, because XLA's event syncs let the pool release the list between calls.
-The XLA path's `float64` normals wrote 45 and 41 GiB/s at 2^27 and 2^24 before it found its misses
-by a binary search.
+tandem-cuda's own benchmark. At 2^24 the launch and dispatch cost of each call is a larger share:
+a second run of the session moved those tandem_jax cells by up to 15 %, the 2^27 cells by under
+3 %. cuRAND leads at 2^24 because its host calls skip JAX's dispatch, and on the exponential and
+randint rows because its nearest call does less work: uniforms without the logarithm, 32-bit words
+without bounding. The extension vendors tandem-cuda bab9870, before its folded exponential, which
+tandem-cuda runs at 1149 GiB/s in float32. The `float64` normals are the ziggurat's two kernels, a
+table pass and a pass over the misses, as in tandem-cuda, which writes 788 to 825 GiB/s at 2^24.
+The kernels take the same time here. The miss list comes from XLA's scratch allocator. A
+stream-ordered allocation in each call held 2^24 at 468 GiB/s, because XLA's event syncs let the
+pool release the list between calls. The XLA path's `float64` normals wrote 45 and 41 GiB/s at
+2^27 and 2^24 before it found its misses by a binary search.
