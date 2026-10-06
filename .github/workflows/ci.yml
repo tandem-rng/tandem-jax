@@ -32,9 +32,11 @@ jobs:
           python -c "import tandem_jax; assert tandem_jax._ffi.tandem_jax_cpu"
       - run: pytest -rs
   vectors:
-    name: vectors are current
+    name: vectors and conformance files are current
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: git clone --depth 1 https://github.com/tandem-rng/spec ../spec
+      - run: git clone -q https://github.com/tandem-rng/spec ../spec
       - run: diff ../spec/vectors.json tests/vectors.json
+      # tests/conformance copies conformance/*.json at this spec commit.
+      - run: for f in tests/conformance/*.json; do git -C ../spec show "f420545:conformance/$(basename $f)" | diff - $f; done

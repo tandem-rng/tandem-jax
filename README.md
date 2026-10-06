@@ -31,6 +31,7 @@ z = jax.random.normal(k1, (1000,))                 # any jax.random function
 x, pos = tj.stream(key, 0, 2**20, jnp.float64)     # Float64 draws, and the position after
 r = tj.randint(key, (1000,), 0, 6, jnp.int32)      # Lemire bounded integers
 e = tj.exponential(key, (1000,))                   # exponentials -ln(1 - u), Appendix A
+i = tj.choice(key, (1000,), tj.choice_table([1, 2, 7]))  # weighted choice, Appendix C
 kids, pos = tj.fork(key, pos, 4)                   # the spec's fork, typed keys, jit-safe
 ```
 

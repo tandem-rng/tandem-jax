@@ -77,6 +77,18 @@ exact across ports. `float32` normals agree to the tolerance of Appendix A. Neit
 give `-ln(1 - u)` of one uniform draw each, as Appendix A defines them, exact across ports in
 `float64` and `float32`. `n = 0` leaves the position unchanged.
 
+`tj.choice_table(weights)` builds the integer alias table of
+[Appendix C](https://github.com/tandem-rng/spec/blob/main/SPEC.md#appendix-c-weighted-choice-non-normative)
+on the host from finite, nonnegative weights, not all zero. `tj.choice(key, shape, table,
+position=0)` and `stream_choice(key, position, n, table)` draw `uint32` indices with probability
+proportional to the weights. Element `i` maps `uint64` draw `i` by integer operations only and
+never retries, so the indices are exact across ports and `n = 0` aligns the position to 64 bits.
+Unlike `jax.random.choice`, they draw with replacement from a prebuilt table. They run on the XLA
+path on every backend and need `jax_enable_x64`.
+
+A fill from a Python integer position whose end would reach 2^64 raises `ValueError`. Array and
+traced positions are not checked.
+
 64-bit types need `jax.config.update("jax_enable_x64", True)`.
 
 ## Parallel use

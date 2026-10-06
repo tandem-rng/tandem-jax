@@ -13,6 +13,8 @@ import functools
 import importlib.resources
 import json
 import math
+from fractions import Fraction
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +25,7 @@ from jax.extend.random import define_prng_impl
 from . import _core, _ffi
 from ._core import DOMAIN_FOLD, DOMAIN_FORK, DOMAIN_SPLIT, U32, F, F_keyed, T, whiten
 
-__all__ = ["impl", "impl_for", "key", "key_data", "split", "sub", "stream", "uniform", "stream_normal", "normal", "stream_exponential", "exponential", "stream_randint", "randint", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
+__all__ = ["impl", "impl_for", "key", "key_data", "split", "sub", "stream", "uniform", "stream_normal", "normal", "stream_exponential", "exponential", "stream_randint", "randint", "ChoiceTable", "choice_table", "stream_choice", "choice", "T", "F", "F_keyed", "whiten", "block", "fork", "fork_words"]
 
 K = 32
 """The chunk length of the default key implementation: the canonical Tandem8x32-K32."""
@@ -199,6 +201,7 @@ def stream(k, position, n, dtype=jnp.float64, chunk_length=None):
     if dtype not in _WIDTH:
         raise TypeError(f"stream does not support dtype {dtype}")
     w = _WIDTH[dtype]
+    _check_end(position, w, n)
     position = _position(position)
     aligned = _align(position, w)
     key = key_data(k)
@@ -320,6 +323,8 @@ def stream_normal(k, position, n, dtype=None):
     dtype = jnp.dtype(dtype if dtype is not None else _default_float())
     if dtype not in (jnp.dtype("float32"), jnp.dtype("float64")):
         raise TypeError(f"normal needs float32 or float64, got {dtype}")
+    w = 8 * dtype.itemsize
+    _check_end(position, w, n if w == 64 else 2 * ((n + 1) // 2))
     position = _position(position)
     if n == 0:
         return jnp.zeros(0, dtype), _align(position, 64) if dtype.itemsize == 8 else position
@@ -639,6 +644,7 @@ def stream_exponential(k, position, n, dtype=None):
     dtype = jnp.dtype(dtype if dtype is not None else _default_float())
     if dtype not in (jnp.dtype("float32"), jnp.dtype("float64")):
         raise TypeError(f"exponential needs float32 or float64, got {dtype}")
+    _check_end(position, 8 * dtype.itemsize, n)
     position = _position(position)
     if n == 0:
         return jnp.zeros(0, dtype), position
@@ -822,6 +828,12 @@ def stream_randint(k, position, n, minval, maxval, dtype=None, width=None):
             too_wide = False
         if too_wide:
             raise ValueError("width 32 needs ranges of at most 2^32")
+    if isinstance(position, (int, np.integer)):
+        try:
+            w = width or (32 if wide.itemsize == 4 or not bool(jnp.any((r > wide.type(2**32)) | full)) else 64)
+        except jax.errors.ConcretizationTypeError:
+            w = width or 64
+        _check_end(position, w, n)
     if n == 0:
         return jnp.zeros(0, dtype), _position(position)
 
@@ -865,3 +877,85 @@ def randint(k, shape, minval, maxval, dtype=None, position=0, width=None):
     shape = (shape,) if isinstance(shape, int) else tuple(shape)
     flat = lambda a: a if jnp.ndim(a) == 0 else jnp.broadcast_to(a, shape).reshape(-1)
     return stream_randint(k, position, math.prod(shape), flat(minval), flat(maxval), dtype, width)[0].reshape(shape)
+
+
+# Appendix C of the specification: weighted choice by an integer alias table.
+
+
+class ChoiceTable(NamedTuple):
+    """The alias table of Appendix C: the column capacity `S` as a uint64 scalar, and `cut` (uint64)
+    and `alias` (uint32) of shape (m,)."""
+
+    capacity: jax.Array
+    cut: jax.Array
+    alias: jax.Array
+
+
+def choice_table(weights):
+    """The alias table of Appendix C for `m` weights, finite, nonnegative and not all zero, with
+    `1 <= m < 2^32`. Weights convert to float64 first. The table comes from exact integer
+    arithmetic on the host, so every port builds the same one."""
+    w = [float(x) for x in np.asarray(weights, np.float64).reshape(-1)]
+    m = len(w)
+    if not 1 <= m < 2**32 or not all(math.isfinite(x) and x >= 0 for x in w) or max(w) == 0:
+        raise ValueError("weights must be 1 to 2^32 - 1 finite nonnegative numbers, not all zero")
+    e = math.frexp(max(w))[1] - 1
+    t0 = 63 - m.bit_length() - e
+    ceil2 = lambda x, t: math.ceil(Fraction(x) * Fraction(2) ** t)
+    t = t0 + 63 - sum(ceil2(x, t0) for x in w).bit_length()
+    cut = [ceil2(x, t) for x in w]
+    total = sum(cut)
+    pad = (m - total % m) % m
+    cut[cut.index(max(cut))] += pad
+    s = (total + pad) // m
+    alias = list(range(m))
+    full = lambda start: next((i for i in range(start, m) if cut[i] >= s), m)
+    big = full(0)
+    for i in range(m):
+        j = i
+        while j <= i and cut[j] < s:
+            alias[j] = big
+            cut[big] -= s - cut[j]
+            j = big
+            if cut[big] < s:
+                big = full(big + 1)
+    return ChoiceTable(jnp.uint64(s), jnp.asarray(cut, jnp.uint64), jnp.asarray(alias, jnp.uint32))
+
+
+def stream_choice(k, position, n, table):
+    """`n` indices in [0, m) from stream bit `position` by the alias `table` of `choice_table`, as
+    uint32, and the position after them. Index `i` maps uint64 draw `i` by integer operations only
+    and never retries, so a fill consumes `n` draws, a cut fill equals the whole fill, and the
+    indices equal every other port's. `n = 0` aligns the position to 64 bits. Needs
+    `jax_enable_x64`."""
+    if not jax.config.jax_enable_x64:
+        raise ValueError("weighted choice needs jax_enable_x64, its draws are 64 bits wide")
+    _check_end(position, 64, n)
+    position = _position(position)
+    if n == 0:
+        return jnp.zeros(0, jnp.uint32), _align(position, 64)
+    return _choice(key_data(k), position, n, ChoiceTable(*table), _chunk_length(k))
+
+
+@functools.partial(jax.jit, static_argnames=("n", "chunk"))
+def _choice(key, position, n, table, chunk):
+    r, pos = stream(key, position, n, jnp.uint64, chunk)
+    f, j = _mulhilo64(r, jnp.uint64(table.cut.shape[0]))
+    v = _mulhilo64(f, table.capacity)[1]
+    j = j.astype(jnp.int64)
+    return jnp.where(v < table.cut[j], j.astype(jnp.uint32), table.alias[j]), pos
+
+
+def choice(k, shape, table, position=0):
+    """Indices of `shape` drawn by the alias `table` from stream bit `position`, as `stream_choice`
+    returns them. Unlike `jax.random.choice` it takes a table of weights and draws with
+    replacement. Returns the array only."""
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    return stream_choice(k, position, math.prod(shape), table)[0].reshape(shape)
+
+
+def _check_end(position, w, n):
+    """Refuse a fill from a Python integer position whose end `align(position, w) + w n` reaches
+    2^64, which a uint64 position would wrap past. Array and traced positions are not checked."""
+    if isinstance(position, (int, np.integer)) and -(-int(position) // w) * w + w * n >= 2**64:
+        raise ValueError("the fill would end at or past stream position 2^64")

@@ -1,27 +1,36 @@
 # Tests
 
 ```sh
-pixi run test     # tests/test_tandem.py
+pixi run test     # tests/test_tandem.py and tests/test_conformance.py
 ```
 
 ## Suite
 
+`tests/test_conformance.py` reads `tests/conformance`, copies of the spec's `conformance/*.json`
+at commit `f420545`, and checks every item of the spec's `conformance/CHECKLIST.md`, on the native
+fills and on the XLA path:
+
+- every bounded, normal, exponential and weighted choice case, values and end positions, whole,
+  cut at elements 1, 7, 20, 21 and `n - 1` (even ones for `float32` normals), and one element at
+  a time,
+- the scalar bounded cases, by Lemire's loop over the port's plain draws,
+- the fallback index of rejected and missed draws, the width that follows the range, the empty
+  fills, odd `n` and the pairs of the `float32` normals,
+- the choice tables, rejected weights and `choice` under `jit`,
+- the SHA-256 of the stream dumps and of the port's fills of them, and of the normal and
+  exponential dumps,
+- complex draws across a block, random access across rows and chunks, a draw at 2^63 - 1, and
+  fills that would reach 2^64.
+
 `tests/test_tandem.py`:
 
 - checks every vector of the specification (`tests/vectors.json`),
-- checks `normal` and `randint` against the C and CUDA fixtures in `tests/cross_derived.json`,
-  rejections included, fills from positions 0, 1 and 12345, from both C and CUDA,
 - checks that a bounded fill cut at any element equals the whole fill and that `int32` and
   `int64` agree for a small range,
 - checks `split`, `fork` and `sub` against fixed values from the C reference
   (`tests/cross_port.json`),
 - checks the K = 8 variant, `uniform` and the `bool` and complex stream dtypes against the dumps,
 - compares positioned reads and `jax.random.bits` with reference stream dumps in `tests/data`,
-- checks the `float64` normals bit for bit against tandem-c's `tests/cross_normal.h` at commit
-  `121db59` (rows with wedge, redraw and tail misses) and tandem-cuda's
-  `tests/cross_fill_normal.h` at `2693c63`,
-- checks `exponential` in `float64` and `float32` bit for bit against tandem-c's
-  `tests/cross_exponential.h`, on the native fills and on the XLA path,
 - checks the ziggurat tables against the spec file's SHA-256,
 - checks that the XLA path's `float64` normals keep their values when the misses run in batches
   of one or three, or finish on a gathered set of one or four,
@@ -44,16 +53,13 @@ and does not without the extension.
 
 ## Fixtures
 
-- `tests/vectors.json` is a copy of the spec repository's file, with a drift check in CI.
-- `tests/cross_derived.json` is written by `tools/convert_c_fixtures.py`.
+- `tests/vectors.json` and `tests/conformance/*.json` are copies of the spec repository's files,
+  with a drift check in CI.
 - `tests/cross_port.json` is written by `tools/gen_split_fixture.c`.
-- tandem-c's `tests/cross_normal.h` at commit `121db59` has the SHA-256
-  `3cd7c8f9178711255718288eb712eaccb33a1726d2a185f412f13590398ad3ac`.
-- tandem-c's `tests/cross_exponential.h` at commit `121db59` has the SHA-256
-  `da848bae24dae7d1cde6fdb7ef2e6d2953b76b333ba5139800cba3ae03c85efc`.
 
 ## CI
 
 - CI runs the suite on Linux and macOS, with Python 3.11 and 3.14, with and without the CPU
   extension.
-- A separate job checks that `tests/vectors.json` equals the spec repository's `vectors.json`.
+- A separate job checks that `tests/vectors.json` equals the spec repository's `vectors.json` and
+  `tests/conformance` its `conformance` directory at commit `f420545`.

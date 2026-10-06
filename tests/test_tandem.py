@@ -341,7 +341,11 @@ def test_cross_port_fixture_from_c_reference():
         assert np.array_equal(np.array(got), words(want)), u
 
 
-D = json.loads((HERE / "cross_derived.json").read_text())
+# The rows of tandem-c's cross_normal.h in the spec's conformance file, which test_conformance.py
+# checks in full: Float64 fills with misses of every kind, and the Float32 pairs from bit 1.
+NORMAL = json.loads((HERE / "conformance" / "normal.json").read_text())["cases"]
+ZIG_ROWS = [(c["start"], np.array([int(v, 16) for v in c["values"]], np.uint64).view(np.float64)) for c in NORMAL if c["id"].startswith("cross_normal.h CROSS_NORMAL[")]
+PAIRS32 = np.array([int(v, 16) for v in next(c for c in NORMAL if c["id"] == "cross_normal.h CROSS_NORMALF")["values"]], np.uint32).view(np.float32)
 ULP32 = 2.0**-23
 
 
@@ -354,15 +358,6 @@ def close(got, want, dtype, ulps32=8):
 def test_zig_tables_are_the_spec_file():
     path = Path(tj.__file__).with_name("normal_f64_zig1024.json")
     assert hashlib.sha256(path.read_bytes()).hexdigest() == "8b961dd46a2582b953bd8780138edb0ad712e3d243a366a123ffc8978d0a33ab"
-
-
-def test_normal64_equals_the_c_reference_bit_for_bit():
-    # tandem-c's tests/cross_normal.h: the last rows hold misses of every kind, wedge accepted,
-    # wedge rejected and tail, and starts 0 and 1 share draws at different element indices.
-    k = tj.key(42)
-    for c in D["normal64"]:
-        z, pos = tj.stream_normal(k, c["start"], len(c["out"]), jnp.float64)
-        assert np.array_equal(np.array(z), np.array(c["out"])) and int(pos) == c["end_pos"], c["start"]
 
 
 @pytest.mark.parametrize("batch, few", [(1, 256), (3, 256), (None, 1), (None, 4)])
@@ -383,41 +378,20 @@ def test_normal64_misses_in_batches_and_gathered_rounds(monkeypatch, batch, few)
     jax.clear_caches()
     try:
         assert np.array_equal(f(), one)
-        for c in D["normal64"]:
-            z, _ = tj.stream_normal(k, c["start"], len(c["out"]), jnp.float64)
-            assert np.array_equal(np.array(z), np.array(c["out"])), c["start"]
+        for start, want in ZIG_ROWS:
+            z, _ = tj.stream_normal(k, start, len(want), jnp.float64)
+            assert np.array_equal(np.array(z), want), start
     finally:
         monkeypatch.undo()
         jax.clear_caches()
 
 
-def test_normal32_pairs_match_c_reference():
-    z, pos = tj.stream_normal(tj.key(42), 1, len(D["pairs32"]), jnp.float32)
-    assert z.dtype == np.float32 and int(pos) == D["pairs32_end_pos"]
-    close(z, D["pairs32"], np.float32)
-
-
-def test_normal_fills_match_cuda_fixtures():
-    k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)
-    for c in D["device_normal64"]:
-        z, pos = tj.stream_normal(k, c["pos"], c["n"], jnp.float64)
-        assert np.array_equal(np.array(z), np.array(c["out"])) and int(pos) == (c["pos"] + 63) // 64 * 64 + 64 * c["n"]
-    for c in D["device_normal32"]:
-        z, pos = tj.stream_normal(k, c["pos"], c["n"], jnp.float32)
-        close(z, c["out"], np.float32)
-        assert int(pos) == (c["pos"] + 31) // 32 * 32 + 32 * 2 * ((c["n"] + 1) // 2)
-        assert np.array_equal(np.array(tj.normal(k, c["n"], jnp.float32, c["pos"])), np.array(z))
-
-
 def test_normal_edge_cases():
     k = tj.key(42)
-    z, pos = tj.stream_normal(k, 5, 0, jnp.float64)
-    assert z.shape == (0,) and int(pos) == 64
-    z, pos = tj.stream_normal(k, 5, 0, jnp.float32)
-    assert z.shape == (0,) and int(pos) == 5
     odd, pos_odd = tj.stream_normal(k, 0, 5, jnp.float32)
     even, pos_even = tj.stream_normal(k, 0, 6, jnp.float32)
     assert np.array_equal(np.array(odd), np.array(even[:5])) and int(pos_odd) == int(pos_even) == 6 * 32
+    assert np.array_equal(np.array(tj.normal(k, 5, jnp.float32, 0)), np.array(odd))
     f = jax.jit(lambda k, p: tj.stream_normal(k, p, 100, jnp.float32)[0])
     # Fusion may change the last bit of a float32 sin or cos.
     close(f(k, jnp.uint64(640)), np.array(tj.stream_normal(k, 640, 100, jnp.float32)[0]), np.float32, ulps32=2)
@@ -425,32 +399,8 @@ def test_normal_edge_cases():
         tj.normal(k, (2,), jnp.float16)
 
 
-def _exponential_rows():
-    k = tj.key(42)
-    for name, dtype in (("exponential64", np.float64), ("exponential32", np.float32)):
-        for c in D[name]:
-            z, pos = tj.stream_exponential(k, c["start"], len(c["out"]), dtype)
-            assert z.dtype == dtype and int(pos) == c["end_pos"], (name, c["start"])
-            assert np.array_equal(np.array(z), np.array(c["out"], dtype)), (name, c["start"])
-
-
-def test_exponential_equals_the_c_reference_bit_for_bit(monkeypatch):
-    # tandem-c's tests/cross_exponential.h, on the native fills where they load and on the XLA path.
-    _exponential_rows()
-    monkeypatch.setattr(tj._ffi, "tandem_jax_cpu", None)
-    monkeypatch.setattr(tj._ffi, "tandem_jax_cuda", None)
-    jax.clear_caches()
-    try:
-        _exponential_rows()
-    finally:
-        monkeypatch.undo()
-        jax.clear_caches()
-
-
 def test_exponential_edge_cases():
     k = tj.key(42)
-    z, pos = tj.stream_exponential(k, 5, 0, jnp.float64)
-    assert z.shape == (0,) and int(pos) == 5
     assert np.array_equal(np.array(tj.exponential(k, (2, 3), jnp.float32, 7)), np.array(tj.stream_exponential(k, 7, 6, jnp.float32)[0]).reshape(2, 3))
     with pytest.raises(TypeError):
         tj.exponential(k, (2,), jnp.float16)
@@ -478,50 +428,6 @@ def test_randint_uniform_through_rejections():
     counts = np.bincount((x * bins // r).astype(np.int64), minlength=bins)
     chi2 = ((counts - n / bins) ** 2 / (n / bins)).sum()
     assert abs(chi2 - (bins - 1)) < 5 * (2 * (bins - 1)) ** 0.5
-
-
-@pytest.mark.parametrize("name, dtype", [("fill_below32", jnp.uint32), ("fill_below64", jnp.uint64)])
-def test_randint_matches_c_fills(name, dtype):
-    k, w = tj.key(42), 32 if dtype == jnp.uint32 else 64
-    for c in D[name]:
-        got, pos = tj.stream_randint(k, c["start"], len(c["out"]), 0, c["range"], dtype, w)
-        assert np.array_equal(np.array(got), np.array(c["out"], dtype)), (c["start"], c["range"])
-        assert int(pos) == c["end_pos"]
-        assert np.array_equal(np.array(tj.randint(k, (len(c["out"]),), 0, c["range"], dtype, c["start"], w)), np.array(got))
-    assert {c["start"] for c in D[name]} >= {0, 1, 12345}
-    # The fallback key depends on the start, so the fixtures at 12345 must contain rejections.
-    big = [c for c in D[name] if c["start"] == 12345 and c["range"] > 2**31]
-    plain = lambda c: (np.array(tj.stream(k, 12345, 64, dtype)[0]).astype(object) * c["range"]) >> w
-    assert any(list(plain(c)) != c["out"] for c in big)
-
-
-@pytest.mark.parametrize("name, w", [("scalar_below32", 32), ("scalar_below64", 64)])
-def test_scalar_bounded_fixtures_match_sequential_lemire(name, w):
-    # A scalar draw rejects by taking the next draw of the main stream, which stream_randint
-    # does not do, so the fixture is checked against Lemire's loop over the plain draws.
-    k = tj.key(42)
-    draws = [int(x) for x in np.array(tj.stream(k, 1, 600, jnp.dtype(f"uint{w}"))[0])]
-    for c in D[name]:
-        r, out, used = c["range"], [], 0
-        t = ((1 << w) - r) % r
-        while len(out) < len(c["out"]):
-            m = draws[used] * r
-            used += 1
-            if m % (1 << w) >= t:
-                out.append(m >> w)
-        assert out == c["out"], r
-        # The fixture starts at bit 1, which aligns up to one draw width.
-        assert w + w * used == c["end_pos"], r
-
-
-@pytest.mark.parametrize("name, dtype", [("device_below32", jnp.uint32), ("device_below64", jnp.uint64)])
-def test_randint_matches_cuda_fills_with_rejections(name, dtype):
-    k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)
-    assert max(c["rejected"] for c in D[name]) > 30
-    for c in D[name]:
-        want, w = np.array(c["out"], dtype), 32 if dtype == jnp.uint32 else 64
-        assert np.array_equal(np.array(tj.stream_randint(k, 0, 64, 0, c["range"], dtype, w)[0]), want), c["range"]
-        assert np.array_equal(np.array(tj.randint(k, (64,), 0, c["range"], dtype, width=w)), want)
 
 
 def test_randint_bounds_dtypes_and_heavy_rejection():
@@ -640,19 +546,6 @@ def test_randint_array_bounds_under_jit_and_vmap():
         assert np.array_equal(np.array(rows[i]), np.array(f(keys[i], 0, int(his[i]))))
 
 
-@pytest.mark.parametrize("name, dtype, w", [("device_below32_at", jnp.uint32, 32), ("device_below64_at", jnp.uint64, 64)])
-def test_randint_matches_cuda_fills_at_nonzero_starts(name, dtype, w):
-    k = jax.random.wrap_key_data(jnp.array([0x421D21EB, 0x32D31777, 0x62E7564B, 0xDF2BDF82], jnp.uint32), impl=tj.impl)
-    assert sum(c["rejected"] for c in D[name]) > 50 and {c["start"] for c in D[name]} == {1, 12345}
-    for c in D[name]:
-        want = np.array(c["out"], dtype)
-        assert np.array_equal(np.array(tj.stream_randint(k, c["start"], 64, 0, c["range"], dtype, w)[0]), want), c
-        if (w == 32 or c["range"] > 2**32) and c["range"] < 2**63:
-            # Width from the range: an int64 result type must not change a 32-bit draw.
-            auto = tj.stream_randint(k, c["start"], 64, 0, c["range"], jnp.int64)[0]
-            assert np.array_equal(np.array(auto).astype(np.uint64), want.astype(np.uint64)), c
-
-
 CUDA = jax.default_backend() == "gpu" and tj._ffi.tandem_jax_cuda is not None
 cuda_only = pytest.mark.skipif(not CUDA, reason="needs a CUDA device and the tandem_jax_cuda extension")
 
@@ -759,8 +652,8 @@ def test_cpu_fills_equal_the_xla_path(K, monkeypatch):
 @cpu_only
 def test_cpu_normal32_equals_the_c_reference_bit_for_bit():
     with jax.default_device(jax.devices("cpu")[0]):
-        z, _ = tj.stream_normal(tj.key(42), 1, len(D["pairs32"]), jnp.float32)
-    assert np.array_equal(np.array(z), np.array(D["pairs32"], np.float32))
+        z, _ = tj.stream_normal(tj.key(42), 1, len(PAIRS32), jnp.float32)
+    assert np.array_equal(np.array(z), PAIRS32)
 
 
 @cpu_only
