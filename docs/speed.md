@@ -8,18 +8,20 @@
 Apple M4 Pro, XLA CPU backend, `jax_enable_x64`, `pixi run bench 22`, jitted, minimum of five
 runs after a half-second warm-up, GiB/s of output, 2^22 elements, median of three passes in one
 session. The `cpu/` column has the extension installed, which splits each fill over XLA's thread
-pool.
+pool. Each cell runs in its own process. After heavy XLA work, every large write in a process
+slows, XLA's own `jnp.full` from 200 to about 40 GiB/s, and in one process the `cpu/` `float64`
+uniforms read 32.
 
 | draw | tandem_jax | tandem_jax with `cpu/` | threefry |
 |---|---|---|---|
-| uniform float32 | 5.3 | 81 | 2.7 |
-| uniform float64 | 4.4 | 32 | 4.8 |
-| normal float32 | 3.2 | 28 | 2.0 |
-| normal float64 | 3.5 | 25 | 2.2 |
-| exponential float32 | 1.4 | 35 | 2.2 |
-| exponential float64 | 0.98 | 22 | 2.4 |
-| randint int32 in [0, 1000) | 2.8 | 35 | 1.4 |
-| randint int64 in [0, 1000) | 4.8 | 28 | 2.4 |
+| uniform float32 | 6.0 | 93 | 3.6 |
+| uniform float64 | 5.4 | 102 | 6.0 |
+| normal float32 | 3.6 | 32 | 2.8 |
+| normal float64 | 3.9 | 58 | 2.8 |
+| exponential float32 | 1.7 | 48 | 2.7 |
+| exponential float64 | 1.1 | 46 | 3.1 |
+| randint int32 in [0, 1000) | 3.2 | 46 | 1.7 |
+| randint int64 in [0, 1000) | 6.4 | 87 | 3.0 |
 
 The XLA path costs the same per 32-bit word at every width: its `float64` uniforms run at the
 rate of 2n `uint32` words. Threefry hashes once per element and returns 64 bits for `float64`, so
