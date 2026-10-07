@@ -39,4 +39,4 @@ jobs:
       - run: git clone -q https://github.com/tandem-rng/spec ../spec
       - run: diff ../spec/vectors.json tests/vectors.json
       # tests/conformance copies conformance/*.json at this spec commit.
-      - run: for f in tests/conformance/*.json; do git -C ../spec show "f420545:conformance/$(basename $f)" | diff - $f; done
+      - run: for f in tests/conformance/*.json; do git -C ../spec show "2a4bd08:conformance/$(basename $f)" | diff - $f; done
