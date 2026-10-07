@@ -7,7 +7,7 @@ pixi run test     # tests/test_tandem.py and tests/test_conformance.py
 ## Suite
 
 `tests/test_conformance.py` reads `tests/conformance`, copies of the spec's `conformance/*.json`
-at commit `f420545`, and checks every item of the spec's `conformance/CHECKLIST.md` at b31af72, on the native
+at commit `2a4bd08`, and checks every item of the spec's `conformance/CHECKLIST.md` at 2a4bd08, on the native
 fills and on the XLA path:
 
 - every bounded, normal, exponential and weighted choice case, values and end positions, whole,
@@ -62,4 +62,4 @@ and does not without the extension.
 - CI runs the suite on Linux and macOS, with Python 3.11 and 3.14, with and without the CPU
   extension.
 - A separate job checks that `tests/vectors.json` equals the spec repository's `vectors.json` and
-  `tests/conformance` its `conformance` directory at commit `f420545`.
+  `tests/conformance` its `conformance` directory at commit `2a4bd08`.

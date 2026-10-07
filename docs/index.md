@@ -32,7 +32,7 @@ pip install --no-build-isolation ./cpu
 ```
 
 `cpu/tandem` holds `tandem.c`, `tandem.h` and `tandem_normal_tables.h` of tandem-c commit
-`121db59`, with the ziggurat `float64` normals. Its source is compiled with `-ffp-contract=off`,
+`1c75956`, with the ziggurat `float64` normals. Its source is compiled with `-ffp-contract=off`,
 as tandem-c's Makefile does, which keeps the normals bit exact on every compiler.
 
 ### CUDA kernels

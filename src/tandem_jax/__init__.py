@@ -624,23 +624,35 @@ def _div_f32(a, b):
     return q
 
 
-def _neg2_log_f32(x):
-    """The float32 form of the reference logarithm in tandem-c, -2 ln x for float32 x in (0, 1]."""
+def _neg_log_f32(x):
+    """tandem-c's neg_log_f32, -ln x for float32 x in (0, 1] within 0.58 ulp. The leading term
+    u = (2 - 2m) / (m + 1) is carried as uh + r / d, with m + 1 = d + dl exactly and r the residual
+    of uh, and nk ln2_hi + uh is split exactly by fast two-sum. The ones are opaque, since XLA
+    would fold (m + 1) - 1 to m."""
+    f = np.float32
     ix = lax.bitcast_convert_type(x, U32) + U32(0x004AFB0D)
     nk = (127 - (ix >> U32(23)).astype(jnp.int32)).astype(jnp.float32)
     m = lax.bitcast_convert_type((ix & U32(0x007FFFFF)) + U32(0x3F3504F3), jnp.float32)
-    s = _div_f32(m - 1.0, m + 1.0)
-    z = _alone(s * s)
-    p = _fma(z, np.float32(0.14275366), np.float32(0.20000061))
-    p = _fma(z, _fma(z, p, np.float32(0.33333334)), np.float32(1.0))
-    return _fma(nk, np.float32(2.857213530660374e-06), _fma(nk, np.float32(1.38629150390625), _alone((s * -4.0) * p)))
+    one = _opaque(f(1.0), m)
+    num = _fma(m, f(-2.0), f(2.0))
+    d = m + one
+    dl = m - (d - one)
+    rcp = _div_f32(one, d)
+    uh = _alone(num * rcp)
+    r = _fma(-uh, dl, _fma(-uh, d, num))
+    v = _alone(uh * uh)
+    q = _fma(v, _fma(v, f(0.0023109776), f(0.012496489)), f(0.08333336))
+    a = _alone(nk * f(0.693145751953125))
+    hi = a + uh
+    e = uh - (hi - a)
+    return hi + _fma(_alone(uh * v), q, _fma(r, rcp, _fma(nk, f(1.428606765330187e-06), e)))
 
 
 def stream_exponential(k, position, n, dtype=None):
     """`n` standard exponentials `-ln(1 - u)` from stream bit `position`, one uniform draw `u` of
-    `dtype` each as Appendix A defines them, and the position after them. They halve the reference
-    logarithm, in float32 its float32 form, and equal tandem-c bit for bit. `n = 0` leaves the
-    position unchanged."""
+    `dtype` each as Appendix A defines them, and the position after them. float64 halves the
+    reference logarithm, float32 takes tandem-c's neg_log_f32, and both equal tandem-c bit for bit.
+    `n = 0` leaves the position unchanged."""
     dtype = jnp.dtype(dtype if dtype is not None else _default_float())
     if dtype not in (jnp.dtype("float32"), jnp.dtype("float64")):
         raise TypeError(f"exponential needs float32 or float64, got {dtype}")
@@ -657,8 +669,7 @@ def _exponential(key, position, n, dtype, chunk):
 
     def xla():
         u, _ = stream(key, position, n, dtype, chunk)
-        log = _neg2_log if w == 64 else _neg2_log_f32
-        return 0.5 * log(1.0 - u)
+        return 0.5 * _neg2_log(1.0 - u) if w == 64 else _neg_log_f32(1.0 - u)
 
     call = lambda: _ffi.fill(key, position, n, dtype, chunk, "exponential")
     out = _ffi.native(chunk >= _ffi.TILE_STEPS, True, call, xla)

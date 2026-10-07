@@ -12,7 +12,7 @@ fills from [tandem-c](https://github.com/tandem-rng/tandem-c) on the CPU and
 kernels from [tandem-cuda](https://github.com/tandem-rng/tandem-cuda) on NVIDIA GPUs. It produces the
 stream the specification defines, bit for bit, fast on CPU and GPU.
 
-Needs Python 3.11 and `jax>=0.10`. `cpu/tandem` is tandem-c commit `121db59`. The headers in
+Needs Python 3.11 and `jax>=0.10`. `cpu/tandem` is tandem-c commit `1c75956`. The headers in
 `cuda/include` are tandem-cuda commit `2693c63`.
 
 ```sh
