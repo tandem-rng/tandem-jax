@@ -77,7 +77,7 @@ __device__ __forceinline__ void fill_tile(uint4 *tile, const Params &q, uint32_t
     bool mine = gb + gi <= r1 / K;
     uint32_t o[4], h[4];
     F_keyed(q.key, 8u * (gb + gi) + lane, DOMAIN_STREAM, AUX_STREAM, o, h);
-    const Ctx x{q.key, K, bd.range, bd.low, bd.thresh};
+    const Ctx x{q.key, K, bd.range, bd.low, bd.thresh, bd.table};
     uint64_t block_first = gb * K * 128u;
     for (uint32_t jb = 0; jb < K; jb += TILE_STEPS) {
         if (block_first + jb * 128u > b1) break;
