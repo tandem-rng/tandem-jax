@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 
 #include "normal_tables.hpp"
 
@@ -99,6 +100,16 @@ TANDEM_FN void block(const uint32_t key[4], uint64_t c, uint32_t j, uint32_t out
 
 TANDEM_FN uint64_t align_pos(uint64_t pos, unsigned w) {
     return (pos + w - 1u) & ~((uint64_t)w - 1u);
+}
+
+/* The end align(pos, a) + w units of a fill, for host entry points to check before they launch or
+ * write: the spec requires the end below 2^64, so a fill that reaches it throws std::length_error.
+ * Host only. */
+inline uint64_t fill_end(uint64_t pos, unsigned a, unsigned w, uint64_t units) {
+    const uint64_t top = ~(uint64_t)0;
+    if (pos > top - (a - 1u) || units > (top - align_pos(pos, a)) / w)
+        throw std::length_error("tandem: the fill's end reaches 2^64");
+    return align_pos(pos, a) + w * units;
 }
 
 TANDEM_FN unsigned log2k(uint32_t K) {
@@ -325,6 +336,8 @@ template <class T> struct Pair2 {
     T z0, z1;
 };
 
+struct ChoiceTable;
+
 /* Host Float32 Box-Muller without libm in the loop, so that a compiler vectorizes a block of
  * pairs. A pair (a, b) gives r = sqrt(-2 ln(1 - a)) and the normals r cos(2 pi b) and
  * r sin(2 pi b), cos first. It is the same arithmetic as tandem-c's, so host builds agree bit for
@@ -538,15 +551,21 @@ TANDEM_FN float div_rn_unit(float n, float d) {
  * L(1 - u) / 2 with the reference logarithm, where 1 - u and the halving are exact. */
 TANDEM_FN double exponential_f64(double u) { return detail::neg_log_f64(1.0 - u); }
 
-/* The f32 logarithm with the factors folded in as in neg_log_f64. */
+/* tandem-c's neg_log_f32 of 1 - u, within 0.58 ulp of -ln(1 - u) for every u on the 2^-24 grid:
+ * u = (2 - 2m) / (m + 1) is carried as uh + r / d, and nk ln2_hi + uh is split by fast two-sum.
+ * The reciprocal is the device's IEEE division of 1 by d, and every product feeds an fma
+ * operand or is exact, so contraction cannot change the bits. */
 TANDEM_FN float exponential_f32(float u) {
     using detail::fmaf_;
     uint32_t ix = detail::f32_bits(1.0f - u) + 0x004afb0du;
     float nk = (float)(127 - (int32_t)(ix >> 23)); /* -k */
     float mant = detail::f32_from_bits((ix & 0x007fffffu) + 0x3f3504f3u);
-    float t = detail::div_rn_unit(fmaf_(mant, -2.0f, 2.0f), mant + 1.0f), z4 = t * t;
-    float p = fmaf_(z4, fmaf_(z4, fmaf_(z4, 0.14275366f / 64, 0.20000061f / 16), 0.33333334f / 4), 1.0f);
-    return fmaf_(nk, 2.857213530660374e-06f / 2, fmaf_(nk, 1.38629150390625f / 2, t * p));
+    float num = fmaf_(mant, -2.0f, 2.0f), d = mant + 1.0f, dl = mant - (d - 1.0f);
+    float rcp = detail::div_rn_unit(1.0f, d), uh = fmaf_(num, rcp, 0.0f);
+    float r = fmaf_(-uh, dl, fmaf_(-uh, d, num)), v = uh * uh;
+    float q = fmaf_(v, fmaf_(v, 0.0023109776f, 0.012496489f), 0.08333336f);
+    float a = nk * 0.693145751953125f, hi = a + uh, e = uh - (hi - a);
+    return hi + fmaf_(uh * v, q, fmaf_(r, rcp, fmaf_(nk, 1.428606765330187e-06f, e)));
 }
 
 TANDEM_FN bool operator==(const Key &a, const Key &b) {
@@ -669,6 +688,12 @@ template <class D> class Draws {
         }
         return mulhi64(x, range);
     }
+    /* A bounded draw whose width comes from the range, for interfaces that name only the result
+     * type: 32 bits for range <= 2^32, else 64 (spec Appendix A). Range 2^32 returns the draw. */
+    TANDEM_FN uint64_t below(uint64_t range) {
+        if (range >> 32 == 0) return urand((uint32_t)range);
+        return range == (uint64_t)1 << 32 ? urand() : urand64(range);
+    }
     TANDEM_FN uint32_t urand(uint32_t start, uint32_t end) { return start + urand(end - start); }
     TANDEM_FN uint64_t urand64(uint64_t start, uint64_t end) {
         return start + urand64(end - start);
@@ -716,6 +741,10 @@ template <class D> class Draws {
      * host and device. An exponential fill equals the sequence of these calls. */
     TANDEM_FN double exponential() { return exponential_f64(drand()); }
     TANDEM_FN float exponentialf() { return exponential_f32(frand()); }
+
+    /* Weighted choice from one UInt64 draw (spec Appendix C), element 0 of a choice fill that
+     * starts here. The table's arrays must be readable where the draw runs. */
+    TANDEM_FN uint32_t choice(const ChoiceTable &t);
 
     /* Random access: element i of the fill that would start here, without advancing. */
     TANDEM_FN uint32_t at_urand(uint64_t i) const { return (uint32_t)at(i, 32); }
@@ -778,16 +807,27 @@ class Rng : public Draws<Rng> {
         s_.init(key, 0, K);
     }
 
+    /* A start pos >= 2^63 is rejected as set_position rejects it: the generator keeps position 0. */
     TANDEM_FN static Rng from_key(const Key &key, uint64_t pos = 0, uint32_t K = 0) {
         Rng r;
-        r.s_.init(key.w, pos, K);
+        r.s_.init(key.w, 0, K);
+        r.set_position(pos);
         return r;
     }
 
     TANDEM_FN Key key() const { return Key{{s_.key[0], s_.key[1], s_.key[2], s_.key[3]}}; }
     TANDEM_FN uint64_t position() const { return s_.pos; }
     TANDEM_FN uint32_t chunk_length() const { return s_.K; }
-    TANDEM_FN void set_position(uint64_t p) { s_.pos = p; }
+    /* Move to bit position p. Return false and change nothing when p >= 2^63, the spec's limit
+     * for a start position. */
+    TANDEM_FN bool set_position(uint64_t p) {
+        if (p >> 63) return false;
+        s_.pos = p;
+        return true;
+    }
+    /* Move to the end p of draws or a fill made from this generator, unchecked: an end may lie
+     * at or past 2^63, which set_position rejects as a start. */
+    TANDEM_FN void advance_to(uint64_t p) { s_.pos = p; }
 
     TANDEM_FN friend bool operator==(const Rng &a, const Rng &b) {
         return a.key() == b.key() && a.s_.pos == b.s_.pos && a.s_.K == b.s_.K;
@@ -962,6 +1002,17 @@ TANDEM_FN uint64_t below_u64_t(uint64_t x, uint64_t range, uint64_t t, const uin
     return mulhi64(x, range);
 }
 
+/* The draw width of a bounded fill whose interface names only the result type: 32 bits for
+ * range <= 2^32, else 64 (spec Appendix A). */
+TANDEM_FN unsigned below_width(uint64_t range) { return range <= (uint64_t)1 << 32 ? 32u : 64u; }
+
+/* below_u32_t for a range up to 2^32, with t the threshold of the range's low word. Range 2^32
+ * never rejects and returns the draw u. */
+TANDEM_FN uint32_t below_u32_wide(uint32_t u, uint64_t range, uint32_t t, const uint32_t key[4],
+                                  uint32_t K, uint64_t g) {
+    return range >> 32 ? u : below_u32_t(u, (uint32_t)range, t, key, K, g);
+}
+
 TANDEM_FN uint32_t below_u32(uint32_t u, uint32_t range, const uint32_t key[4], uint32_t K,
                              uint64_t g) {
     return below_u32_t(u, range, below_threshold_u32(range), key, K, g);
@@ -970,6 +1021,103 @@ TANDEM_FN uint32_t below_u32(uint32_t u, uint32_t range, const uint32_t key[4], 
 TANDEM_FN uint64_t below_u64(uint64_t x, uint64_t range, const uint32_t key[4], uint32_t K,
                              uint64_t g) {
     return below_u64_t(x, range, below_threshold_u64(range), key, K, g);
+}
+
+/* Weighted choice (spec Appendix C): an index in [0, m) with probability proportional to its
+ * weight, by an alias table in integers. Column j holds mass cut[j] of index j and capacity -
+ * cut[j] of alias[j]. Element i of a fill maps UInt64 draw i, so it consumes 64 bits and never
+ * retries, and a fill cut anywhere equals the whole fill. The table and the indices equal
+ * tandem-c's tandem_choice_table and tandem_choice bit for bit. The table views arrays it does not
+ * own: host arrays for host draws, device arrays for device draws. */
+struct ChoiceTable {
+    uint64_t capacity; /* S, the mass of one column */
+    const uint64_t *cut;
+    const uint32_t *alias;
+    uint32_t m;
+};
+
+/* The index of draw r: column j = floor(r m / 2^64), and the fraction r m mod 2^64 picks j or its
+ * alias. */
+TANDEM_FN uint32_t choice_of(const ChoiceTable &t, uint64_t r) {
+    uint64_t j = mulhi64(r, t.m), f = mulhi64(r * t.m, t.capacity);
+#if defined(__CUDA_ARCH__)
+    return f < __ldg(t.cut + j) ? (uint32_t)j : __ldg(t.alias + j);
+#else
+    return f < t.cut[j] ? (uint32_t)j : t.alias[j];
+#endif
+}
+
+template <class D> TANDEM_FN uint32_t Draws<D>::choice(const ChoiceTable &t) {
+    return choice_of(t, urand64());
+}
+
+namespace detail {
+inline unsigned bit_length(uint64_t x) {
+    unsigned n = 0;
+    for (; x; x >>= 1) n++;
+    return n;
+}
+
+/* ceil(w 2^t) for finite w >= 0, exact, from the integer significand of w. ldexp alone would
+ * round a positive w to 0 where the product is subnormal. The caller keeps the result below
+ * 2^64. */
+inline uint64_t ceil_scaled(double w, int t) {
+    if (w == 0) return 0;
+    int E;
+    uint64_t s = (uint64_t)std::ldexp(std::frexp(w, &E), 53); /* w = s 2^(E - 53) */
+    int k = E - 53 + t;
+    if (k >= 0) return s << k;
+    if (k <= -54) return 1;
+    return (s >> -k) + ((s & ((uint64_t(1) << -k) - 1u)) != 0);
+}
+} // namespace detail
+
+/* Build the table of m weights on the host into the caller's cut and alias arrays of m entries,
+ * with no draw. Return false and build nothing unless 1 <= m < 2^32 and the weights are finite,
+ * not negative and not all zero. The scale puts the mass total just below 2^63 for weights of any
+ * magnitude, from a first pass at a scale that cannot overflow. The pairing is Vose's alias
+ * method in exact integers, in place: cut holds the masses until a column is paired. */
+inline bool choice_build(ChoiceTable &table, const double *weights, size_t m, uint64_t *cut,
+                         uint32_t *alias) {
+    if (m == 0 || (uint64_t)m > 0xffffffffu) return false;
+    double wmax = 0;
+    for (size_t i = 0; i < m; i++) {
+        if (!(std::isfinite(weights[i]) && weights[i] >= 0)) return false;
+        if (weights[i] > wmax) wmax = weights[i];
+    }
+    if (wmax == 0) return false;
+    int e;
+    std::frexp(wmax, &e);
+    int t = 63 - (int)detail::bit_length(m) - (e - 1);
+    uint64_t total = 0;
+    for (size_t i = 0; i < m; i++) total += detail::ceil_scaled(weights[i], t);
+    t += 63 - (int)detail::bit_length(total);
+    total = 0;
+    size_t big = 0;
+    for (size_t i = 0; i < m; i++) {
+        cut[i] = detail::ceil_scaled(weights[i], t);
+        total += cut[i];
+        if (cut[i] > cut[big]) big = i;
+        alias[i] = (uint32_t)i;
+    }
+    uint64_t s = (total + m - 1u) / m;
+    cut[big] += s * m - total;
+
+    /* l is the first column at or above capacity. A short column takes l as its alias, and l,
+     * if that leaves it short and the outer loop has passed it, is paired at once. */
+    size_t l = 0;
+    while (cut[l] < s) l++;
+    for (size_t i = 0; i < m; i++)
+        for (size_t j = i; j <= i && cut[j] < s;) {
+            alias[j] = (uint32_t)l;
+            cut[l] -= s - cut[j];
+            j = l;
+            if (cut[l] < s)
+                do l++;
+                while (l < m && cut[l] < s);
+        }
+    table = ChoiceTable{s, cut, alias, (uint32_t)m};
+    return true;
 }
 
 } // namespace tandem

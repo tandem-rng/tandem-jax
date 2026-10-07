@@ -10,8 +10,9 @@
  *     integers, normals and exponentials, which are not part of the specification. A bounded
  *     element consumes one draw and a rejected draw retries on a fallback stream, an f64 normal
  *     is the ziggurat of one draw, an f32 normal is Box-Muller of two draws of the fill, and an
- *     exponential is -ln(1 - u) of one draw.
- *     See the README for the stream contract.
+ *     exponential is -ln(1 - u) of one draw. See the README for the stream contract.
+ *   - tandem::fill_choice: weighted choice indices through an alias table built on the host,
+ *     one UInt64 draw per element.
  *   - tandem::generator: key, position and K on the host, whose fill_* calls advance the
  *     position.
  *   - tandem::device_rng: a per-thread generator with one cached chunk state, for kernels
@@ -84,18 +85,21 @@ struct exp_f64 {};   /* exponentials of the Float64 draws, stored as double */
  * a low bound. O may be wider than the draw. */
 template <class O> struct below32 {};
 template <class O> struct below64 {};
+struct choice_idx {}; /* weighted choice indices of the UInt64 draws, stored as uint32_t */
 
 /* The range and low bound of a bounded fill, and its rejection threshold, computed once. */
 struct Bound {
     uint64_t range, low, thresh;
+    ChoiceTable table{};
 };
 
-/* What a kind needs beyond the block words: the fill's key and chunk length, and the range
- * of the bounded kinds. */
+/* What a kind needs beyond the block words: the fill's key and chunk length, the range of the
+ * bounded kinds, and the choice table. */
 struct Ctx {
     const uint32_t *key;
     uint32_t K;
     uint64_t range, low, thresh;
+    ChoiceTable table;
 };
 
 /* How an output element is made from the four words of a block. `i` is the element's index in
@@ -180,6 +184,13 @@ template <class O> struct elem<below64<O>> {
         return (O)(U)((U)x.low + (U)v);
     }
 };
+template <> struct elem<choice_idx> {
+    using out_t = uint32_t;
+    static constexpr unsigned bits = 64;
+    __device__ static out_t make(const uint32_t w[4], unsigned i, uint64_t, const Ctx &x) {
+        return choice_of(x.table, w[2 * i] | ((uint64_t)w[2 * i + 1] << 32));
+    }
+};
 template <> struct elem<bool_bits> {
     using out_t = bool;
     static constexpr unsigned bits = 1;
@@ -256,7 +267,7 @@ __global__ void fill_rows_kernel(uint32_t key0, uint32_t key1, uint32_t key2, ui
     const uint32_t key[4] = {key0, key1, key2, key3};
     uint32_t o[4], h[4];
     F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
-    const Ctx x{key, K, bd.range, bd.low, bd.thresh};
+    const Ctx x{key, K, bd.range, bd.low, bd.thresh, bd.table};
     uint64_t row = g * K;
     uint32_t j0 = row < r0 ? (uint32_t)(r0 - row) : 0u;
     uint32_t j1 = (uint32_t)(r1 - row < K - 1u ? r1 - row : K - 1u);
@@ -320,7 +331,7 @@ __global__ void __launch_bounds__(THREADS)
     const uint32_t key[4] = {key0, key1, key2, key3};
     uint32_t o[4], h[4];
     F_keyed(key, c, DOMAIN_STREAM, AUX_STREAM, o, h);
-    const Ctx x{key, K, bd.range, bd.low, bd.thresh};
+    const Ctx x{key, K, bd.range, bd.low, bd.thresh, bd.table};
     uint64_t block_first = gb * K * 128u; /* stream byte of the block's first row */
     for (uint32_t jb = 0; jb < K; jb += TILE_STEPS) {
         if (block_first + jb * 128u > b1) break;
@@ -797,7 +808,7 @@ constexpr size_t NORMAL_LIST_MIN = (size_t)1 << 16;
 inline uint64_t fill_normal_f64_impl(const uint32_t key[4], uint64_t pos, uint32_t K, double *out,
                                      size_t n, cudaStream_t stream) {
     K = K ? K : DEFAULT_K;
-    uint64_t p0 = align_pos(pos, 64);
+    uint64_t p0 = align_pos(pos, 64), p1 = fill_end(pos, 64, 64, n);
     if (n == 0) return p0;
     uint64_t d0 = p0 >> 6, ba = d0 >> 1, bb = (d0 + n - 1u) >> 1;
     uint64_t g0 = (ba >> 3) / K, g1 = (bb >> 3) / K, chunks = 8u * (g1 - g0 + 1u);
@@ -826,7 +837,7 @@ inline uint64_t fill_normal_f64_impl(const uint32_t key[4], uint64_t pos, uint32
         (void)cudaGetLastError();
         fill_normal64_fused<<<blocks, THREADS, 0, stream>>>(key[0], key[1], key[2], key[3], K, g0,
                                                             d0, n, out);
-        return p0 + 64u * (uint64_t)n;
+        return p1;
     }
     auto count = static_cast<unsigned long long *>(scratch);
     auto list = reinterpret_cast<NormalMiss *>(static_cast<char *>(scratch) + 16);
@@ -858,7 +869,7 @@ inline uint64_t fill_normal_f64_impl(const uint32_t key[4], uint64_t pos, uint32
     } else {
         cudaFreeAsync(scratch, stream);
     }
-    return p0 + 64u * (uint64_t)n;
+    return p1;
 }
 
 /* The float Box-Muller step of the fill kernel. It is box_muller2_f32 with the angle through
@@ -943,8 +954,8 @@ inline uint64_t fill_normal_f32_impl(const uint32_t key[4], uint64_t pos, uint32
                                      float *out, size_t n, cudaStream_t stream) {
     K = K ? K : DEFAULT_K;
     if (n == 0) return pos;
-    uint64_t np = ((uint64_t)n + 1u) / 2u;
-    uint64_t p0 = align_pos(pos, 32), p1 = p0 + np * 64u;
+    uint64_t np = (uint64_t)n / 2u + (n & 1u);
+    uint64_t p0 = align_pos(pos, 32), p1 = fill_end(pos, 32, 64, np);
     uint64_t s0 = p0 >> 5, ba = s0 >> 2, bb = (s0 + 2u * np - 1u) >> 2;
     uint64_t g0 = (ba >> 3) / K, g1 = (bb >> 3) / K;
     unsigned blocks = (unsigned)((8u * (g1 - g0 + 1u) + THREADS - 1) / THREADS);
@@ -962,10 +973,10 @@ inline uint64_t fill_normal_f32_impl(const uint32_t key[4], uint64_t pos, uint32
 template <class E>
 inline uint64_t fill(const uint32_t key[4], uint64_t pos, uint32_t K,
                      typename elem<E>::out_t *out, size_t n, cudaStream_t stream,
-                     bool tile = true, Bound bd = Bound{0, 0, 0}) {
+                     bool tile = true, Bound bd = Bound{}) {
     constexpr unsigned bits = elem<E>::bits;
     K = K ? K : DEFAULT_K;
-    uint64_t p0 = align_pos(pos, bits), p1 = p0 + (uint64_t)n * bits;
+    uint64_t p0 = align_pos(pos, bits), p1 = fill_end(pos, bits, bits, n);
     if (n == 0) return p1;
     uint64_t r0 = p0 >> 10, r1 = (p1 - 1) >> 10;
     uint64_t g0 = r0 / K, g1 = r1 / K;
@@ -1127,6 +1138,17 @@ inline uint64_t fill_normal_f32(const uint32_t key[4], uint64_t pos, uint32_t K,
     return detail::fill_normal_f32_impl(key, pos, K, out, n, stream);
 }
 
+/* Weighted choice (spec Appendix C): element i is choice_of(table, UInt64 draw i) of the fill that
+ * starts at pos aligned to 64 bits, so the fill consumes n draws, never retries, equals the
+ * device_rng::choice calls and is bit identical to tandem-c's tandem_fill_choice. The table's cut
+ * and alias arrays must be device memory: build them with choice_build on the host and copy them.
+ * n = 0 returns pos aligned to 64 bits. Not part of the specification. */
+inline uint64_t fill_choice(const uint32_t key[4], uint64_t pos, uint32_t K, const ChoiceTable &table,
+                            uint32_t *out, size_t n, cudaStream_t stream = 0) {
+    return detail::fill<detail::choice_idx>(key, pos, K, out, n, stream, true,
+                                            detail::Bound{0, 0, 0, table});
+}
+
 /* Standard exponentials -ln(1 - u), element i from Float64 (Float32) draw i of the fill that
  * starts at pos aligned to 64 (32) bits, so a fill equals the Rng::exponential (exponentialf)
  * calls and is bit identical to tandem-c's tandem_fill_exponential_f64 (f32). Each thread
@@ -1223,6 +1245,9 @@ struct generator {
     }
     uint64_t fill_exponential_f64(double *out, size_t n, cudaStream_t s = 0) {
         return pos = tandem::fill_exponential_f64(key, pos, K, out, n, s);
+    }
+    uint64_t fill_choice(const ChoiceTable &table, uint32_t *out, size_t n, cudaStream_t s = 0) {
+        return pos = tandem::fill_choice(key, pos, K, table, out, n, s);
     }
     uint64_t fill_exponential_f32(float *out, size_t n, cudaStream_t s = 0) {
         return pos = tandem::fill_exponential_f32(key, pos, K, out, n, s);

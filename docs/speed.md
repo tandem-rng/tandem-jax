@@ -55,7 +55,7 @@ exponential reads, or `curandGenerate` into the same bytes.
 | uniform float64 | 24 | 1054 | 122 | 787 | `curandGenerateUniformDouble` | 863 |
 | normal float32 | 24 | 660 | 76 | 863 | `curandGenerateNormal` | 422 |
 | normal float64 | 24 | 765 | 50 | 568 | `curandGenerateNormalDouble` | 227 |
-| exponential float32 | 24 | 639 | 55 | 1143 | `curandGenerateUniform`, nearest | 510 |
+| exponential float32 | 24 | 553 | 54 | 1152 | `curandGenerateUniform`, nearest | 498 |
 | exponential float64 | 24 | 861 | 63 | 787 | `curandGenerateUniformDouble`, nearest | 454 |
 | randint int32 in [0, 1000) | 24 | 641 | 55 | 1150 | `curandGenerate`, nearest | 300 |
 | randint int64 in [0, 1000) | 24 | 1000 | 102 | 1240 | `curandGenerate`, nearest | 543 |
@@ -63,7 +63,7 @@ exponential reads, or `curandGenerate` into the same bytes.
 | uniform float64 | 27 | 1348 | 109 | 803 | `curandGenerateUniformDouble` | 1022 |
 | normal float32 | 27 | 1203 | 93 | 887 | `curandGenerateNormal` | 431 |
 | normal float64 | 27 | 1031 | 72 | 587 | `curandGenerateNormalDouble` | 223 |
-| exponential float32 | 27 | 1099 | 65 | 1269 | `curandGenerateUniform`, nearest | 535 |
+| exponential float32 | 27 | 879 | 61 | 1276 | `curandGenerateUniform`, nearest | 526 |
 | exponential float64 | 27 | 893 | 59 | 803 | `curandGenerateUniformDouble`, nearest | 445 |
 | randint int32 in [0, 1000) | 27 | 1216 | 93 | 1293 | `curandGenerate`, nearest | 331 |
 | randint int64 in [0, 1000) | 27 | 1286 | 156 | 1302 | `curandGenerate`, nearest | 570 |
@@ -73,9 +73,11 @@ tandem-cuda's own benchmark. At 2^24 the launch and dispatch cost of each call i
 a second run of the session moved those tandem_jax cells by up to 7 %, the 2^27 cells by under
 2 %. cuRAND leads at 2^24 because its host calls skip JAX's dispatch, and on the exponential and
 randint rows because its nearest call does less work: uniforms without the logarithm, 32-bit words
-without bounding. The extension vendors tandem-cuda 2693c63. Against bab9870 in the same session,
-its folded exponential took the 2^27 exponentials from 957 to 1099 GiB/s in `float32` and from 868
-to 893 in `float64`, and the `float32` normals moved from 1190 to 1203.
+without bounding. The extension vendors tandem-cuda e98daee, whose `float32` exponential is
+within 0.571 ulp for every draw, so that `1 - exp(-x)` maps back to the draw's own 2^-24 grid
+point. Its two-float logarithm takes 10 more f32 operations per draw than the single-float one
+before it. The `float32` exponential rows come from a later session than the rest, on GPU 1 of the
+same machine by the same method, where the other 2^27 cells read within 3 % of the table.
 
 The `float64` normals are the ziggurat's two kernels, a table pass and a pass over the misses, as in tandem-cuda, which writes 788 to 825 GiB/s at 2^24.
 The kernels take the same time here. The miss list comes from XLA's scratch allocator. A
