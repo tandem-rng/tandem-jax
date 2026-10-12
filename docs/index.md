@@ -9,7 +9,7 @@ bit.
 - [API](api.md): typed keys, `jax.random` on a Tandem key, the `tj` functions and parallel use.
 - [Design](design.md): the CPU and CUDA fills, bounded integers and normals.
 - [Tests](tests.md): what the suite checks, where the fixtures come from, and what CI runs.
-- [Speed](speed.md): the M4 Pro CPU and A100 figures against threefry.
+- [Performance](speed.md): the M4 Pro CPU and A100 figures against threefry.
 
 ## Install
 

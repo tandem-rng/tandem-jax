@@ -1,4 +1,4 @@
-# Speed
+# Performance
 
 `pixi run bench 22` produces the CPU figures and `python tools/bench.py` the GPU figures.
 `jax.random` uses the default threefry2x32 key in both.
