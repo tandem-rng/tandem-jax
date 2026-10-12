@@ -12,14 +12,15 @@ fills from [tandem-c](https://github.com/tandem-rng/tandem-c) on the CPU and
 kernels from [tandem-cuda](https://github.com/tandem-rng/tandem-cuda) on NVIDIA GPUs. It produces the
 stream the specification defines, bit for bit, fast on CPU and GPU.
 
-Needs Python 3.11 and `jax>=0.10`. `cpu/tandem` is tandem-c commit `1c75956`. The headers in
-`cuda/include` are tandem-cuda commit `e98daee`.
+## Install
 
 ```sh
 pip install .
 pip install --no-build-isolation ./cpu     # optional tandem-c fills on the CPU
 pip install --no-build-isolation ./cuda    # optional CUDA kernels
 ```
+
+## Quick start
 
 ```python
 import jax, jax.numpy as jnp
@@ -35,9 +36,16 @@ i = tj.choice(key, (1000,), tj.choice_table([1, 2, 7]))  # weighted choice, Appe
 kids, pos = tj.fork(key, pos, 4)                   # the spec's fork, typed keys, jit-safe
 ```
 
+## Requirements
+
+Needs Python 3.11 and `jax>=0.10`. `cpu/tandem` is tandem-c commit `1c75956`. The headers in
+`cuda/include` are tandem-cuda commit `e98daee`.
+
+## Documentation
+
 See the [documentation](https://tandem-rng.github.io/tandem-jax/) for the build requirements of
 `cpu/` and `cuda/`, the API, tests and speed.
 
 Portions of the code were generated with the assistance of LLMs.
 
-[Documentation](https://tandem-rng.github.io/tandem-jax/) · [Apache 2.0 license](LICENSE)
+[Docs](https://tandem-rng.github.io/tandem-jax/) · [Specification](https://github.com/tandem-rng/spec/blob/main/SPEC.md) · [Website](https://tandem-rng.github.io/) · [Issues](https://github.com/tandem-rng/tandem-jax/issues) · [License](LICENSE)
