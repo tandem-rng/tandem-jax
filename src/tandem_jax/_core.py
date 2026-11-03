@@ -111,17 +111,22 @@ def child_keys(key, counter_lo, counter_hi, domain, aux, hidden):
     return jnp.where(hidden[..., None] != 0, h, o)
 
 
-def rows(key, group0, ngroups, K):
-    """Stream words of `ngroups` groups from `group0` at chunk length `K`, as a flat array
-    in stream order: row by row, eight 128-bit blocks per row. The array may extend past the
-    last group."""
+def _group_state(key, group0, ngroups):
+    """Seed the eight lanes of each group."""
     c = jnp.asarray(8 * group0, jnp.uint64 if jax.config.jax_enable_x64 else U32)
     c = c + jnp.arange(8 * ngroups, dtype=c.dtype)
     if c.dtype == jnp.uint64:
         counter = (c.astype(U32), (c >> jnp.uint64(32)).astype(U32))
     else:
         counter = (c, jnp.zeros_like(c))
-    o, h = F_keyed(key, counter, DOMAIN_STREAM, AUX_STREAM)
+    return F_keyed(key, counter, DOMAIN_STREAM, AUX_STREAM)
+
+
+def rows(key, group0, ngroups, K):
+    """Stream words of `ngroups` groups from `group0` at chunk length `K`, as a flat array
+    in stream order: row by row, eight 128-bit blocks per row. The array may extend past the
+    last group."""
+    o, h = _group_state(key, group0, ngroups)
 
     def step(state, _):
         o, h = T(*state)
@@ -133,12 +138,32 @@ def rows(key, group0, ngroups, K):
     return blocks.reshape(-1)
 
 
+def _short_words(key, word0, n_words, K):
+    """Advance the required prefix without retaining it, then keep only the requested rows."""
+    word0 = jnp.asarray(word0, jnp.uint64 if jax.config.jax_enable_x64 else U32)
+    row0 = word0 >> 5
+    state = _group_state(key, row0 // K, 1)
+    state = lax.fori_loop(U32(0), U32(row0 % K), lambda _, s: T(*s), state)
+
+    def step(state, i):
+        row = row0 + i
+        state = lax.cond((i != 0) & (row % K == 0), lambda: _group_state(key, row // K, 1), lambda: state)
+        o, h = T(*state)
+        return (o, h), jnp.stack(o, -1)
+
+    nrows = (n_words + 62) // 32
+    _, blocks = lax.scan(step, state, jnp.arange(nrows, dtype=row0.dtype))
+    return lax.dynamic_slice(blocks.reshape(-1), (word0 & 31,), (n_words,))
+
+
 def words_from(key, bit_position, n_words, K=32):
     """`n_words` uint32 stream words from a 32-bit aligned `bit_position` (static `n_words`)."""
     from . import _ffi
 
     def xla():
         word0 = bit_position >> 5
+        if 0 < n_words < 32 * K:
+            return _short_words(key, word0, n_words, K)
         row0 = word0 >> 5
         group0 = row0 // K
         nrows = (n_words + 31) // 32 + 1

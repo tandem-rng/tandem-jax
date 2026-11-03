@@ -160,6 +160,22 @@ def test_jit_and_vmap():
     assert np.array_equal(np.array(s(k, 640)), np.array(tj.stream(k, 640, 100, jnp.float64)[0]))
 
 
+@pytest.mark.parametrize("x64", [False, True])
+def test_short_stream_dynamic_positions(monkeypatch, x64):
+    monkeypatch.setattr(tj._ffi, "tandem_jax_cpu", None)
+    monkeypatch.setattr(tj._ffi, "tandem_jax_cuda", None)
+    want = dump("k1234_K8_u32.bin", np.uint32)
+    with jax.enable_x64(x64):
+        k = jax.random.wrap_key_data(KEY1234, impl=tj.impl_for(8))
+        starts = np.array([0, 31, 255, 511])
+        positions = jnp.asarray(starts * 32, jnp.uint64 if x64 else jnp.uint32)
+        for n in (1, 33, 255, 256):
+            draw = jax.jit(jax.vmap(lambda p, n=n: tj.stream(k, p, n, jnp.uint32)))
+            got, ends = draw(positions)
+            assert np.array_equal(np.array(got), np.stack([want[s : s + n] for s in starts]))
+            assert np.array_equal(np.array(ends), (starts + n) * 32)
+
+
 def _split_oracle(key_words, i):
     o, h = tj.F_keyed(
         tuple(key_words), (jnp.uint32((i >> 1) & 0xFFFFFFFF), jnp.uint32(i >> 33)), tj._core.DOMAIN_SPLIT, 0
